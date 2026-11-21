@@ -1,6 +1,6 @@
 sphinx>=4.3.0
 sphinx-autodoc-typehints
-sphinx-rtd-theme>=0.5.1
+sphinx-rtd-theme>=3.1.0
 sphinxcontrib-htmlhelp
 sphinxcontrib-jsmath
 sphinxcontrib-serializinghtml
