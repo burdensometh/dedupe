@@ -13,6 +13,7 @@ from dedupe.convenience import (  # noqa: F401
     training_data_link,
 )
 from dedupe.serializer import read_training, write_training  # noqa: F401
+from dedupe.training import BudgetConflictError  # noqa: F401
 
 __all__ = [
     "Dedupe",
@@ -21,6 +22,7 @@ __all__ = [
     "StaticDedupe",
     "StaticGazetteer",
     "StaticRecordLink",
+    "BudgetConflictError",
     "canonicalize",
     "console_label",
     "training_data_dedupe",

@@ -1168,7 +1168,10 @@ class ActiveMatching(Matching):
         self.mark_pairs(training_pairs)
 
     def train(
-        self, recall: float = 1.00, index_predicates: bool = True
+        self,
+        recall: float = 1.00,
+        index_predicates: bool = True,
+        candidate_budget: int | None = None,
     ) -> None:  # pragma: no cover
         """
         Learn final pairwise classifier and fingerprinting rules. Requires that
@@ -1190,6 +1193,21 @@ class ActiveMatching(Matching):
                               index predicates, you may get lower
                               recall when true-dupes are not blocked
                               together.
+
+            candidate_budget: The maximum number of unique candidate
+                              pairs that the learned fingerprinting rules
+                              may generate. The cost of a set of rules is
+                              the number of unique record pairs they
+                              block together; pairs covered by more than
+                              one rule are only counted once. The learned
+                              rules are the ones used to generate pairs,
+                              e.g. by :meth:`~dedupe.DedupeMatching.pairs`.
+
+                              If no set of rules can satisfy the `recall`
+                              target within the budget, a
+                              :class:`dedupe.training.BudgetConflictError`
+                              is raised; candidate pairs are never
+                              silently truncated to fit the budget.
         """
         assert (
             self.active_learner is not None
@@ -1198,7 +1216,9 @@ class ActiveMatching(Matching):
         examples, y = flatten_training(self.training_pairs)
         self.classifier.fit(self.data_model.distances(examples), y)
 
-        self.predicates = self.active_learner.learn_predicates(recall, index_predicates)
+        self.predicates = self.active_learner.learn_predicates(
+            recall, index_predicates, candidate_budget=candidate_budget
+        )
         self._fingerprinter = blocking.Fingerprinter(self.predicates)
         self.fingerprinter.reset_indices()
 

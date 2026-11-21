@@ -131,13 +131,18 @@ class BlockLearner(Learner):
         return self._cached_scores
 
     def learn_predicates(
-        self, dupes: TrainingExamples, recall: float, index_predicates: bool
+        self,
+        dupes: TrainingExamples,
+        recall: float,
+        index_predicates: bool,
+        candidate_budget: int | None = None,
     ) -> tuple[Predicate, ...]:
         return self.block_learner.learn(
             dupes,
             recall=recall,
             index_predicates=index_predicates,
             candidate_types="random forest",
+            candidate_budget=candidate_budget,
         )
 
     def _predict(self, pairs: TrainingExamples) -> Labels:
@@ -413,11 +418,17 @@ class DisagreementLearner(HasCandidates):
             learner.fit(self.pairs, self.y)
 
     def learn_predicates(
-        self, recall: float, index_predicates: bool
+        self,
+        recall: float,
+        index_predicates: bool,
+        candidate_budget: int | None = None,
     ) -> tuple[Predicate, ...]:
         dupes = [pair for label, pair in zip(self.y, self.pairs) if label]
         return self.blocker.learn_predicates(
-            dupes, recall=recall, index_predicates=index_predicates
+            dupes,
+            recall=recall,
+            index_predicates=index_predicates,
+            candidate_budget=candidate_budget,
         )
 
 
