@@ -1,3 +1,10 @@
+from dedupe.adapter import (  # noqa: F401
+    ORIGINAL_RECORD_KEY,
+    AdaptationError,
+    FieldSpec,
+    SourceAdapter,
+    original_record,
+)
 from dedupe.api import (  # noqa: F401
     Dedupe,
     Gazetteer,
@@ -21,6 +28,11 @@ __all__ = [
     "StaticDedupe",
     "StaticGazetteer",
     "StaticRecordLink",
+    "SourceAdapter",
+    "FieldSpec",
+    "AdaptationError",
+    "ORIGINAL_RECORD_KEY",
+    "original_record",
     "canonicalize",
     "console_label",
     "training_data_dedupe",

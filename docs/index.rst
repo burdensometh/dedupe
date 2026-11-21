@@ -46,6 +46,7 @@ Contents
 
    API-documentation
    Variable-definition
+   Field-adapters
    Examples
    how-it-works/How-it-works
    Troubleshooting

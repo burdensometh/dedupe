@@ -120,6 +120,23 @@ Library Documentation
     .. automethod:: score
     .. automethod:: many_to_n
 
+:class:`SourceAdapter` Objects
+------------------------------
+
+See :ref:`field_adapters` for a full guide to mapping differently named
+(and differently typed) source fields onto the common fields of the data
+model.
+
+.. autoclass:: dedupe.SourceAdapter
+    :members: transform, transform_data
+
+.. autoclass:: dedupe.FieldSpec
+    :members:
+
+.. autoexception:: dedupe.AdaptationError
+
+.. autofunction:: dedupe.original_record
+
 Lower Level Classes and Methods
 -------------------------------
 

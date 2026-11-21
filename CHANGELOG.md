@@ -1,3 +1,11 @@
+# 3.0.3
+- Added persistable input field adapters (`dedupe.SourceAdapter` and
+  `dedupe.FieldSpec`). Per-source field renames, leading-zero padding,
+  case folding, null markers and field types are declared at training
+  time, saved in the settings file and re-applied with identical
+  semantics at matching time. Renamed source fields and incompatible
+  value types raise `dedupe.AdaptationError` instead of being guessed.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

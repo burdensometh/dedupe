@@ -118,6 +118,7 @@ class Variable(Protocol):
 @runtime_checkable
 class FieldVariable(Variable, Protocol):
     field: str
+    type: str
     comparator: Comparator
 
 

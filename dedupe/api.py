@@ -19,6 +19,7 @@ import numpy
 import sklearn.linear_model
 import sklearn.model_selection
 
+import dedupe.adapter as adapter
 import dedupe.blocking as blocking
 import dedupe.clustering as clustering
 import dedupe.core as core
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
         TupleLinks,
         Variable,
     )
+    from dedupe.adapter import Adapters, SourceAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,11 @@ class Matching:
     """
 
     def __init__(
-        self, num_cores: int | None, in_memory: bool = False, **kwargs
+        self,
+        num_cores: int | None,
+        in_memory: bool = False,
+        adapters: Adapters = None,
+        **kwargs,
     ) -> None:
         if num_cores is None:
             self.num_cores = multiprocessing.cpu_count()
@@ -84,6 +90,32 @@ class Matching:
         self.data_model: datamodel.DataModel
         self.classifier: Classifier
         self.predicates: Collection[dedupe.predicates.Predicate]
+
+        self.adapters: tuple[SourceAdapter, ...] | None = adapter.normalize_adapters(
+            adapters
+        )
+
+    def _check_adapter_count(self, expected: Literal[1, 2]) -> None:
+        if self.adapters is None:
+            return
+        if len(self.adapters) != expected:
+            raise adapter.AdaptationError(
+                f"This matcher expects {expected} field adapter"
+                f"{'s' if expected > 1 else ''} (one per data source), "
+                f"got {len(self.adapters)}"
+            )
+
+    def _validate_adapters(self) -> None:
+        if self.adapters is not None:
+            self.adapters = adapter.validate_adapters(self.adapters, self.data_model)
+
+    def _adapt_data(self, data: Data, side: Literal[0, 1] = 0) -> Data:
+        if self.adapters is None:
+            return data
+        return self.adapters[side].transform_data(data)
+
+    def _adapt_pairs(self, pairs: Iterable[TrainingExample]) -> TrainingExamples:
+        return adapter.adapt_record_pairs(pairs, self.adapters)
 
     @property
     def fingerprinter(self) -> blocking.Fingerprinter:
@@ -246,6 +278,8 @@ class DedupeMatching(IntegralMatching):
             ]
         """
 
+        data = self._adapt_data(data)
+
         self.fingerprinter.index_all(data)
 
         id_type = core.sqlite_id_type(data)
@@ -400,6 +434,9 @@ class RecordLinkMatching(IntegralMatching):
                 ),
             ]
         """
+
+        data_1 = self._adapt_data(data_1, side=0)
+        data_2 = self._adapt_data(data_2, side=1)
 
         self.fingerprinter.index_all(data_2)
 
@@ -704,6 +741,8 @@ class GazetteerMatching(Matching):
                   field_names
         """
 
+        data = self._adapt_data(data, side=1)
+
         self.fingerprinter.index_all(data)
 
         id_type = core.sqlite_id_type(data)
@@ -756,6 +795,8 @@ class GazetteerMatching(Matching):
                   dictionaries with the keys being
                   field_names
         """
+
+        data = self._adapt_data(data, side=1)
 
         for field in self.fingerprinter.index_fields:
             self.fingerprinter.unindex(
@@ -825,6 +866,8 @@ class GazetteerMatching(Matching):
                 ],
             ]
         """
+
+        data = self._adapt_data(data, side=0)
 
         id_type = core.sqlite_id_type(data)
 
@@ -1090,6 +1133,16 @@ class StaticMatching(Matching):
                 "Try deleting the file"
             )
 
+        # Settings files written before field adapters existed hold
+        # exactly three pickles; adapters are an optional fourth.
+        try:
+            self.adapters = pickle.load(settings_file)
+        except EOFError:
+            self.adapters = None
+
+        if self.adapters is not None:
+            self.adapters = adapter.validate_adapters(self.adapters, self.data_model)
+
         logger.info("Predicate set:")
         for predicate in self.predicates:
             logger.info(predicate)
@@ -1110,6 +1163,7 @@ class ActiveMatching(Matching):
         variable_definition: Collection[Variable],
         num_cores: int | None = None,
         in_memory: bool = False,
+        adapters: Adapters = None,
         **kwargs,
     ) -> None:
         """
@@ -1128,6 +1182,14 @@ class ActiveMatching(Matching):
                        rather than writing to disk. May be faster if
                        sufficient memory is available.
 
+            adapters: A :class:`~dedupe.adapter.SourceAdapter` (or, for
+                      record linkage, one per data source) describing how
+                      the raw input fields map onto the common field
+                      names of the variable definitions. Adapters are
+                      validated against the data model here, saved into
+                      the settings file and re-applied unchanged at
+                      matching time.
+
         .. warning::
 
             If using multiprocessing on Windows or Mac OS X, then
@@ -1136,9 +1198,10 @@ class ActiveMatching(Matching):
             https://docs.python.org/3/library/multiprocessing.html#the-spawn-and-forkserver-start-methods
 
         """
-        super().__init__(num_cores, in_memory, **kwargs)
+        super().__init__(num_cores, in_memory, adapters=adapters, **kwargs)
 
         self.data_model = datamodel.DataModel(variable_definition)
+        self._validate_adapters()
         self.training_pairs = {"distinct": [], "match": []}
         self.classifier = sklearn.model_selection.GridSearchCV(
             estimator=sklearn.linear_model.LogisticRegression(),
@@ -1231,6 +1294,7 @@ class ActiveMatching(Matching):
         pickle.dump(self.data_model, file_obj)
         pickle.dump(self.classifier, file_obj)
         pickle.dump(self.predicates, file_obj)
+        pickle.dump(self.adapters, file_obj)
 
     def uncertain_pairs(self) -> TrainingExamples:
         """
@@ -1292,6 +1356,12 @@ class ActiveMatching(Matching):
            the data or training file supplied to the
            :func:`~prepare_training` method.
         """
+        if self.adapters is not None:
+            labeled_pairs = {
+                "match": self._adapt_pairs(labeled_pairs["match"]),
+                "distinct": self._adapt_pairs(labeled_pairs["distinct"]),
+            }
+
         self._checkTrainingPairs(labeled_pairs)
 
         self.training_pairs["match"].extend(labeled_pairs["match"])
@@ -1393,6 +1463,10 @@ class Dedupe(ActiveMatching, DedupeMatching):
             >>> with open('training_file.json') as f:
             >>>     matcher.prepare_training(data_d, training_file=f)
         """
+        self._check_adapter_count(1)
+
+        data = self._adapt_data(data)
+
         self._checkData(data)
 
         # Reset active learner
@@ -1461,6 +1535,11 @@ class Link(ActiveMatching):
             >>> with open('training_file.json') as f:
             >>>     matcher.prepare_training(data_1, data_2, training_file=f)
         """
+        self._check_adapter_count(2)
+
+        data_1 = self._adapt_data(data_1, side=0)
+        data_2 = self._adapt_data(data_2, side=1)
+
         self._checkData(data_1, data_2)
 
         # Reset active learner
