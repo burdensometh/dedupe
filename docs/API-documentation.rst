@@ -21,6 +21,7 @@ Library Documentation
     .. automethod:: uncertain_pairs
     .. automethod:: mark_pairs
     .. automethod:: train
+    .. automethod:: calibrate
     .. automethod:: write_training
     .. automethod:: write_settings
     .. automethod:: cleanup_training
@@ -59,6 +60,7 @@ Library Documentation
     .. automethod:: uncertain_pairs
     .. automethod:: mark_pairs
     .. automethod:: train
+    .. automethod:: calibrate
     .. automethod:: write_training
     .. automethod:: write_settings
     .. automethod:: cleanup_training
@@ -96,6 +98,7 @@ Library Documentation
     .. automethod:: uncertain_pairs
     .. automethod:: mark_pairs
     .. automethod:: train
+    .. automethod:: calibrate
     .. automethod:: write_training
     .. automethod:: write_settings
     .. automethod:: cleanup_training
@@ -261,3 +264,39 @@ Convenience Functions
 .. autofunction:: dedupe.canonicalize
 .. autofunction:: dedupe.read_training
 .. autofunction:: dedupe.write_training
+
+
+Probability Calibration
+-----------------------
+
+The pairwise classifier's raw scores are not guaranteed to be
+calibrated probabilities, so a score of 0.8 need not mean an 80%
+chance of a match. After training, you can fit a mapping from the
+frozen classifier's raw scores to calibrated probabilities using an
+independent, labeled calibration set via
+:meth:`~dedupe.Dedupe.calibrate` (also available on
+:class:`dedupe.RecordLink` and :class:`dedupe.Gazetteer`).
+
+The calibration set must be independent of the data you will merge:
+the mapping is fitted once and saved in the settings file, never
+refit on the candidates under evaluation. Labels declare the positive
+class explicitly -- ``1`` means the pair refers to the same entity,
+``0`` means the records are distinct -- and per-example sampling
+weights let you correct for how the calibration set was sampled.
+
+Once a mapping is fitted, :meth:`~dedupe.Dedupe.partition`,
+:meth:`~dedupe.RecordLink.join`, and :meth:`~dedupe.Gazetteer.search`
+use calibrated probabilities by default. Pass ``calibrated=False`` to
+score with raw classifier probabilities instead. Because the mapping
+is monotonic, the ranking of candidates is preserved and a single
+threshold scale applies to both ranking and filtering.
+
+A calibration set containing only one label cannot identify a
+mapping; that raises :class:`dedupe.CalibrationError` rather than
+silently collapsing the probabilities.
+
+.. autoclass:: dedupe.ProbabilityCalibrator
+   :members:
+
+.. autoclass:: dedupe.CalibrationError
+   :members:

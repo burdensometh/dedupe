@@ -6,6 +6,10 @@ from dedupe.api import (  # noqa: F401
     StaticGazetteer,
     StaticRecordLink,
 )
+from dedupe.calibration import (  # noqa: F401
+    CalibrationError,
+    ProbabilityCalibrator,
+)
 from dedupe.convenience import (  # noqa: F401
     canonicalize,
     console_label,
@@ -21,6 +25,8 @@ __all__ = [
     "StaticDedupe",
     "StaticGazetteer",
     "StaticRecordLink",
+    "CalibrationError",
+    "ProbabilityCalibrator",
     "canonicalize",
     "console_label",
     "training_data_dedupe",

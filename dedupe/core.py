@@ -21,11 +21,11 @@ if TYPE_CHECKING:
     from dedupe._typing import (
         Block,
         Blocks,
-        Classifier,
         ClosableJoinable,
         Data,
         FeaturizerFunction,
         MapLike,
+        Predictor,
         RecordID,
         RecordIDDType,
         RecordPairs,
@@ -43,7 +43,7 @@ class ScoreDupes:
     def __init__(
         self,
         featurizer: FeaturizerFunction,
-        classifier: Classifier,
+        classifier: Predictor,
         records_queue: _Queue,
         exception_queue: _Queue,
         score_file_path: str,
@@ -102,7 +102,7 @@ class ScoreDupes:
 def scoreDuplicates(
     record_pairs: RecordPairs,
     featurizer: FeaturizerFunction,
-    classifier: Classifier,
+    classifier: Predictor,
     num_cores: int = 1,
 ) -> Scores:
     if num_cores < 2:
@@ -188,7 +188,7 @@ def fillQueue(
 
 
 class ScoreGazette:
-    def __init__(self, featurizer: FeaturizerFunction, classifier: Classifier):
+    def __init__(self, featurizer: FeaturizerFunction, classifier: Predictor):
         self.featurizer = featurizer
         self.classifier = classifier
 
@@ -216,7 +216,7 @@ class ScoreGazette:
 def scoreGazette(
     record_pairs: Blocks,
     featurizer: FeaturizerFunction,
-    classifier: Classifier,
+    classifier: Predictor,
     num_cores: int = 1,
 ) -> Generator[Scores]:
     first, record_pairs = peek(record_pairs)

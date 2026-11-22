@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def connected_components(edgelist: Scores, max_components: int) -> Generator[Scores]:
     if len(edgelist) == 0:
-        raise StopIteration()
+        return
 
     unlabeled_edgelist = edgelist
 

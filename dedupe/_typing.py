@@ -101,6 +101,19 @@ class Classifier(Protocol):
     ) -> numpy.typing.NDArray[numpy.float64]: ...
 
 
+class Predictor(Protocol):
+    """Anything that scores pairwise features as match probabilities.
+
+    Scoring only needs ``predict_proba``, so a calibrated wrapper around
+    a frozen classifier satisfies this protocol without re-implementing
+    :meth:`Classifier.fit`.
+    """
+
+    def predict_proba(
+        self, X: numpy.typing.NDArray[numpy.float64]
+    ) -> numpy.typing.NDArray[numpy.float64]: ...
+
+
 class ClosableJoinable(Protocol):
     def close(self) -> None: ...
 

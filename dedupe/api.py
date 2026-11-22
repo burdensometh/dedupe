@@ -3,6 +3,7 @@
 dedupe provides the main user interface for the library the
 Dedupe class
 """
+
 from __future__ import annotations
 
 import itertools
@@ -16,8 +17,10 @@ import warnings
 from typing import TYPE_CHECKING, Literal, cast, overload
 
 import numpy
+import sklearn.exceptions
 import sklearn.linear_model
 import sklearn.model_selection
+import sklearn.utils.validation
 
 import dedupe.blocking as blocking
 import dedupe.clustering as clustering
@@ -26,6 +29,11 @@ import dedupe.datamodel as datamodel
 import dedupe.labeler as labeler
 import dedupe.predicates
 import dedupe.serializer as serializer
+from dedupe.calibration import (
+    CalibratedClassifier,
+    ProbabilityCalibrator,
+    calibrate_classifier,
+)
 
 if TYPE_CHECKING:
     from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, TextIO
@@ -50,6 +58,7 @@ if TYPE_CHECKING:
         LookupResultsInt,
         LookupResultsStr,
         PathLike,
+        Predictor,
         RecordDict,
     )
     from dedupe._typing import RecordDictPair as TrainingExample
@@ -62,6 +71,7 @@ if TYPE_CHECKING:
         TupleLinks,
         Variable,
     )
+    from dedupe.calibration import CalibrationMethod
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +94,10 @@ class Matching:
         self.data_model: datamodel.DataModel
         self.classifier: Classifier
         self.predicates: Collection[dedupe.predicates.Predicate]
+        # A fitted mapping from raw classifier scores to calibrated
+        # probabilities. None until calibrate() has been run on an
+        # independent, labeled calibration set.
+        self.calibrator: ProbabilityCalibrator | None = None
 
     @property
     def fingerprinter(self) -> blocking.Fingerprinter:
@@ -95,6 +109,128 @@ class Matching:
 
         return self._fingerprinter
 
+    def calibrate(
+        self,
+        calibration_pairs: TrainingExamples,
+        labels: LabelsLike,
+        sample_weight: Collection[float] | None = None,
+        method: CalibrationMethod = "isotonic",
+    ) -> None:
+        """Fit a mapping from raw classifier scores to calibrated
+        probabilities using an independent calibration set.
+
+        The classifier must already be frozen -- either because
+        :func:`train` has run or because the matcher was loaded from a
+        settings file. The calibration set is scored with that frozen
+        classifier and the resulting raw candidate scores are used to
+        fit the mapping. The classifier itself is not refit.
+
+        The calibration set must be independent of the data that will
+        later be merged. Do not pass candidate pairs from the data you
+        are about to partition, join, or search: re-fitting the mapping
+        on the data under evaluation would make the calibrated
+        probabilities dependent on that data and would invalidate any
+        threshold chosen from them. After fitting, the mapping is
+        stored on the matcher and saved by :func:`write_settings`, so
+        static matchers loaded from the settings file reuse it.
+
+        Args:
+            calibration_pairs: Pairs of records from the independent
+                               calibration set.
+            labels: Binary labels aligned with ``calibration_pairs``.
+                    A label of ``1`` declares a positive example: the
+                    two records refer to the same entity (a match /
+                    true duplicate). A label of ``0`` declares a
+                    negative example: the records are distinct.
+            sample_weight: Optional weight for each calibration
+                           example, in the same order as
+                           ``calibration_pairs``. Use this when the
+                           calibration set was sampled with different
+                           inclusion probabilities than the population,
+                           for instance when matches were oversampled.
+            method: How to shape the mapping. ``"isotonic"`` (the
+                    default) fits a monotonic isotonic regression and
+                    needs a reasonably sized calibration set.
+                    ``"sigmoid"`` fits Platt scaling and needs fewer
+                    examples. Both mappings preserve the ranking of
+                    the raw scores.
+
+        Raises:
+            CalibrationError: if the calibration set contains only one
+                              label. A mapping cannot be identified
+                              from matches alone or distinct pairs
+                              alone, so an explicit error is raised
+                              instead of collapsing the probabilities
+                              to a constant.
+        """
+        self._check_classifier_is_frozen()
+
+        labels = list(labels)
+        calibration_pairs = list(calibration_pairs)
+
+        if len(calibration_pairs) != len(labels):
+            raise ValueError(
+                "calibration_pairs and labels must have the same length, "
+                f"got {len(calibration_pairs)} and {len(labels)}"
+            )
+        if not calibration_pairs:
+            raise ValueError("the calibration set must contain at least one pair")
+        if any(label not in (0, 1) for label in labels):
+            raise ValueError("labels must contain only 0 (distinct) and 1 (match)")
+
+        calibrated_classifier = calibrate_classifier(
+            self.classifier,
+            calibration_pairs,
+            self.data_model.distances,
+            labels,
+            sample_weight=sample_weight,
+            method=method,
+        )
+
+        self.calibrator = calibrated_classifier.calibrator
+
+    def _check_classifier_is_frozen(self) -> None:
+        try:
+            sklearn.utils.validation.check_is_fitted(self.classifier)
+        except sklearn.exceptions.NotFittedError:
+            raise ValueError(
+                "The classifier is not trained. Run the train method "
+                "before calibrating probabilities."
+            )
+        except TypeError:
+            # A classifier that is not an sklearn estimator (e.g. a
+            # duck-typed object used in tests). Probe it directly.
+            try:
+                self.classifier.predict_proba(numpy.zeros((1, len(self.data_model))))
+            except Exception as exc:
+                raise ValueError(
+                    "The classifier is not trained. Run the train method "
+                    "before calibrating probabilities."
+                ) from exc
+
+    def _score_classifier(self, calibrated: bool | None) -> Predictor:
+        """Return the classifier used by the scoring workers.
+
+        When ``calibrated`` is None the calibrated mapping is used if
+        one has been fitted, otherwise the raw frozen classifier is
+        used. ``True`` requires a fitted calibration mapping and
+        ``False`` always uses the raw classifier.
+        """
+        if calibrated is None:
+            calibrated = self.calibrator is not None
+
+        if calibrated:
+            if self.calibrator is None:
+                raise ValueError(
+                    "No calibrated probability mapping has been fitted. "
+                    "Call calibrate() with an independent, labeled "
+                    "calibration set first, or pass calibrated=False to "
+                    "use raw classifier scores."
+                )
+            return CalibratedClassifier(self.classifier, self.calibrator)
+
+        return self.classifier
+
 
 class IntegralMatching(Matching):
     """
@@ -102,18 +238,35 @@ class IntegralMatching(Matching):
     pairs before deciding on any matches
     """
 
-    def score(self, pairs: RecordPairs) -> Scores:
+    def score(self, pairs: RecordPairs, calibrated: bool | None = None) -> Scores:
         """
         Scores pairs of records. Returns pairs of tuples of records id and
         associated probabilities that the pair of records are match
 
+        If a calibrated probability mapping has been fitted with
+        :func:`calibrate`, the returned scores are calibrated
+        probabilities by default. Pass ``calibrated=False`` to get the
+        raw classifier scores instead, or ``calibrated=True`` to require
+        that a mapping has been fitted. The same setting should be used
+        for scoring and for any threshold passed to :func:`cluster`,
+        :func:`partition`, :func:`join`, :func:`one_to_one`, or
+        :func:`many_to_one` so that the ranking and the threshold are on
+        the same probability scale.
+
         Args:
             pairs: Iterator of pairs of records
+            calibrated: Whether to apply the calibrated probability
+                        mapping. ``None`` (the default) uses the mapping
+                        if it has been fitted, ``True`` requires one, and
+                        ``False`` uses raw classifier scores.
 
         """
         try:
             matches = core.scoreDuplicates(
-                pairs, self.data_model.distances, self.classifier, self.num_cores
+                pairs,
+                self.data_model.distances,
+                self._score_classifier(calibrated),
+                self.num_cores,
             )
         except RuntimeError:
             raise RuntimeError(
@@ -138,17 +291,23 @@ class DedupeMatching(IntegralMatching):
 
     @overload
     def partition(
-        self, data: DataInt, threshold: float = 0.5
+        self,
+        data: DataInt,
+        threshold: float = 0.5,
+        calibrated: bool | None = None,
     ) -> ClustersInt:  # pragma: no cover
         ...
 
     @overload
     def partition(
-        self, data: DataStr, threshold: float = 0.5
+        self,
+        data: DataStr,
+        threshold: float = 0.5,
+        calibrated: bool | None = None,
     ) -> ClustersStr:  # pragma: no cover
         ...
 
-    def partition(self, data, threshold=0.5):  # pragma: no cover
+    def partition(self, data, threshold=0.5, calibrated=None):  # pragma: no cover
         """
         Identifies records that all refer to the same entity, returns
         tuples containing a sequence of record ids and corresponding
@@ -177,6 +336,16 @@ class DedupeMatching(IntegralMatching):
                        Lowering the number will increase recall,
                        raising it will increase precision
 
+            calibrated: Whether scoring should apply the calibrated
+                        probability mapping fitted with
+                        :func:`calibrate`. ``None`` (the default) uses
+                        the mapping if one has been fitted and raw
+                        classifier scores otherwise, ``True`` requires a
+                        fitted mapping, and ``False`` forces raw scores.
+                        The threshold is always interpreted on the same
+                        scale as the scores, so a calibrated threshold is
+                        a calibrated probability.
+
         Examples:
             >>> duplicates = matcher.partition(data, threshold=0.5)
             >>> duplicates
@@ -187,7 +356,7 @@ class DedupeMatching(IntegralMatching):
             ]
         """
         pairs = self.pairs(data)
-        pair_scores = self.score(pairs)
+        pair_scores = self.score(pairs, calibrated=calibrated)
         clusters = self.cluster(pair_scores, threshold)
         clusters = self._add_singletons(data.keys(), clusters)
         clusters_eval = list(clusters)
@@ -270,22 +439,16 @@ class DedupeMatching(IntegralMatching):
 
             self.fingerprinter.reset_indices()
 
-            con.execute(
-                """CREATE UNIQUE INDEX record_id_block_key_idx
-                           ON blocking_map (record_id, block_key)"""
-            )
-            con.execute(
-                """CREATE INDEX block_key_idx
-                           ON blocking_map (block_key)"""
-            )
+            con.execute("""CREATE UNIQUE INDEX record_id_block_key_idx
+                           ON blocking_map (record_id, block_key)""")
+            con.execute("""CREATE INDEX block_key_idx
+                           ON blocking_map (block_key)""")
             con.execute("""ANALYZE""")
-            pairs = con.execute(
-                """SELECT DISTINCT a.record_id, b.record_id
+            pairs = con.execute("""SELECT DISTINCT a.record_id, b.record_id
                                    FROM blocking_map a
                                    INNER JOIN blocking_map b
                                    USING (block_key)
-                                   WHERE a.record_id < b.record_id"""
-            )
+                                   WHERE a.record_id < b.record_id""")
 
             for a_record_id, b_record_id in pairs:
                 yield (
@@ -416,13 +579,11 @@ class RecordLinkMatching(IntegralMatching):
 
             con.execute("pragma journal_mode=off")
 
-            con.executescript(
-                f"""CREATE TABLE blocking_map_a
+            con.executescript(f"""CREATE TABLE blocking_map_a
                                  (block_key text, record_id {id_type_a});
 
                                  CREATE TABLE blocking_map_b
-                                 (block_key text, record_id {id_type_b});"""
-            )
+                                 (block_key text, record_id {id_type_b});""")
 
             con.executemany(
                 "INSERT INTO blocking_map_a values (?, ?)",
@@ -436,21 +597,17 @@ class RecordLinkMatching(IntegralMatching):
 
             self.fingerprinter.reset_indices()
 
-            con.executescript(
-                """CREATE UNIQUE INDEX block_key_a_idx
+            con.executescript("""CREATE UNIQUE INDEX block_key_a_idx
                                  ON blocking_map_a (record_id, block_key);
 
                    CREATE UNIQUE INDEX block_key_b_idx
-                                 ON blocking_map_b (block_key, record_id);"""
-            )
+                                 ON blocking_map_b (block_key, record_id);""")
             con.execute("""ANALYZE""")
 
-            pairs = con.execute(
-                """SELECT DISTINCT a.record_id, b.record_id
+            pairs = con.execute("""SELECT DISTINCT a.record_id, b.record_id
                                    FROM blocking_map_a a
                                    INNER JOIN blocking_map_b b
-                                   USING (block_key)"""
-            )
+                                   USING (block_key)""")
 
             for a_record_id, b_record_id in pairs:
                 yield (
@@ -467,6 +624,7 @@ class RecordLinkMatching(IntegralMatching):
         data_2: Data,
         threshold: float = 0.5,
         constraint: JoinConstraint = "one-to-one",
+        calibrated: bool | None = None,
     ) -> Links:
         """
         Identifies pairs of records that refer to the same entity.
@@ -522,6 +680,16 @@ class RecordLinkMatching(IntegralMatching):
                               multiple records in data_2 and vice
                               versa. This is like a SQL inner join.
 
+            calibrated: Whether scoring should apply the calibrated
+                        probability mapping fitted with
+                        :func:`calibrate`. ``None`` (the default) uses
+                        the mapping if one has been fitted and raw
+                        classifier scores otherwise, ``True`` requires a
+                        fitted mapping, and ``False`` forces raw scores.
+                        The threshold is always interpreted on the same
+                        scale as the scores, so a calibrated threshold is
+                        a calibrated probability.
+
         Examples:
             >>> links = matcher.join(data_1, data_2, threshold=0.5)
             >>> list(links)
@@ -538,7 +706,7 @@ class RecordLinkMatching(IntegralMatching):
         )
 
         pairs = self.pairs(data_1, data_2)
-        pair_scores = self.score(pairs)
+        pair_scores = self.score(pairs, calibrated=calibrated)
 
         links: Links
         if constraint == "one-to-one":
@@ -713,24 +881,20 @@ class GazetteerMatching(Matching):
         # Set journal mode to WAL.
         con.execute("pragma journal_mode=wal")
 
-        con.execute(
-            f"""CREATE TABLE IF NOT EXISTS indexed_records
+        con.execute(f"""CREATE TABLE IF NOT EXISTS indexed_records
                        (block_key text,
                         record_id {id_type},
-                        UNIQUE(block_key, record_id))"""
-        )
+                        UNIQUE(block_key, record_id))""")
 
         con.executemany(
             "REPLACE INTO indexed_records VALUES (?, ?)",
             self.fingerprinter(data.items(), target=True),
         )
 
-        con.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS
+        con.execute("""CREATE UNIQUE INDEX IF NOT EXISTS
                        indexed_records_block_key_idx
                        ON indexed_records
-                       (block_key, record_id)"""
-        )
+                       (block_key, record_id)""")
         con.execute("""ANALYZE""")
 
         con.commit()
@@ -839,13 +1003,11 @@ class GazetteerMatching(Matching):
             "INSERT INTO blocking_map VALUES (?, ?)", self.fingerprinter(data.items())
         )
 
-        pairs = con.execute(
-            """SELECT DISTINCT a.record_id, b.record_id
+        pairs = con.execute("""SELECT DISTINCT a.record_id, b.record_id
                                FROM blocking_map a
                                INNER JOIN indexed_records b
                                USING (block_key)
-                               ORDER BY a.record_id"""
-        )
+                               ORDER BY a.record_id""")
 
         pair_blocks: (
             Iterable[tuple[int, Iterable[tuple[int, int]]]]
@@ -867,18 +1029,35 @@ class GazetteerMatching(Matching):
         con.execute("ROLLBACK")
         con.close()
 
-    def score(self, blocks: Blocks) -> Generator[Scores]:
+    def score(
+        self, blocks: Blocks, calibrated: bool | None = None
+    ) -> Generator[Scores]:
         """
         Scores groups of pairs of records. Yields structured numpy arrays
         representing pairs of records in the group and the associated
         probability that the pair is a match.
 
+        If a calibrated probability mapping has been fitted with
+        :func:`calibrate`, the returned scores are calibrated
+        probabilities by default. Pass ``calibrated=False`` to get the
+        raw classifier scores instead, or ``calibrated=True`` to require
+        that a mapping has been fitted. Any threshold used in
+        :func:`many_to_n` or :func:`search` should be on the same scale
+        as these scores.
+
         Args:
             blocks: Iterator of blocks of records
+            calibrated: Whether to apply the calibrated probability
+                        mapping. ``None`` (the default) uses the mapping
+                        if it has been fitted, ``True`` requires one, and
+                        ``False`` uses raw classifier scores.
         """
 
         matches = core.scoreGazette(
-            blocks, self.data_model.distances, self.classifier, self.num_cores
+            blocks,
+            self.data_model.distances,
+            self._score_classifier(calibrated),
+            self.num_cores,
         )
 
         return matches
@@ -922,6 +1101,7 @@ class GazetteerMatching(Matching):
         threshold: float = 0.0,
         n_matches: int = 1,
         generator: bool = False,
+        calibrated: bool | None = None,
     ) -> LookupResultsInt:  # pragma: no cover
         ...
 
@@ -932,6 +1112,7 @@ class GazetteerMatching(Matching):
         threshold: float = 0.0,
         n_matches: int = 1,
         generator: bool = False,
+        calibrated: bool | None = None,
     ) -> LookupResultsStr:  # pragma: no cover
         ...
 
@@ -941,6 +1122,7 @@ class GazetteerMatching(Matching):
         threshold=0.0,
         n_matches=1,
         generator=False,
+        calibrated=None,
     ):  # pragma: no cover
         """
         Identifies pairs of records that could refer to the same entity,
@@ -973,6 +1155,16 @@ class GazetteerMatching(Matching):
             generator: when `True`, match will generate a sequence of
                        possible matches, instead of a list.
 
+            calibrated: Whether scoring should apply the calibrated
+                        probability mapping fitted with
+                        :func:`calibrate`. ``None`` (the default) uses
+                        the mapping if one has been fitted and raw
+                        classifier scores otherwise, ``True`` requires a
+                        fitted mapping, and ``False`` forces raw scores.
+                        The threshold is always interpreted on the same
+                        scale as the scores, so a calibrated threshold is
+                        a calibrated probability.
+
         Examples:
             >>> matches = gazetteer.search(data, threshold=0.5, n_matches=2)
             >>> print(matches)
@@ -984,7 +1176,7 @@ class GazetteerMatching(Matching):
             ]
         """
         blocks = self.blocks(data)
-        pair_scores = self.score(blocks)
+        pair_scores = self.score(blocks, calibrated=calibrated)
         search_results = self.many_to_n(pair_scores, threshold, n_matches)
 
         results = self._format_search_results(data, search_results)
@@ -1088,6 +1280,19 @@ class StaticMatching(Matching):
             raise SettingsFileLoadingException(
                 "Something has gone wrong with loading the settings file. "
                 "Try deleting the file"
+            )
+
+        # Settings files written before probability calibration existed
+        # contain only the three objects above. Those matchers simply
+        # have no calibrated mapping.
+        try:
+            self.calibrator = pickle.load(settings_file)
+        except EOFError:
+            self.calibrator = None
+        except:  # noqa: E722
+            raise SettingsFileLoadingException(
+                "Something has gone wrong with loading the calibration "
+                "mapping from the settings file. Try deleting the file"
             )
 
         logger.info("Predicate set:")
@@ -1220,6 +1425,11 @@ class ActiveMatching(Matching):
         Write a settings file containing the
         data model and predicates to a file object
 
+        If a calibrated probability mapping has been fitted with
+        :func:`calibrate`, it is written after the other settings so
+        that static matchers loaded from the file score with
+        calibrated probabilities by default.
+
         Args:
             file_obj: file object to write settings data into
 
@@ -1231,6 +1441,7 @@ class ActiveMatching(Matching):
         pickle.dump(self.data_model, file_obj)
         pickle.dump(self.classifier, file_obj)
         pickle.dump(self.predicates, file_obj)
+        pickle.dump(self.calibrator, file_obj)
 
     def uncertain_pairs(self) -> TrainingExamples:
         """

@@ -1,3 +1,18 @@
+# Unreleased
+- Added probability calibration. After the pairwise classifier is
+  frozen, `calibrate()` fits a savable monotonic mapping (isotonic
+  regression or Platt sigmoid) from raw classifier scores to
+  calibrated probabilities using an independent, labeled calibration
+  set. The positive class (1 = same entity) and per-example sampling
+  weights are declared explicitly. `partition`, `join`, and `search`
+  use calibrated probabilities by default through an optional
+  `calibrated` flag, so ranking and thresholds stay on one scale. The
+  mapping is persisted in settings files; old settings files load with
+  no mapping. A calibration set containing only one label raises
+  `dedupe.CalibrationError` instead of fitting a degenerate mapping.
+- Fixed `RuntimeError` from hierarchical clustering when no scored pair
+  survives the threshold.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 
