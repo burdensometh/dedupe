@@ -13,6 +13,11 @@ from dedupe.convenience import (  # noqa: F401
     training_data_link,
 )
 from dedupe.serializer import read_training, write_training  # noqa: F401
+from dedupe.temporal import (  # noqa: F401
+    StaticTemporalGazetteer,
+    TemporalGazetteer,
+    TemporalReference,
+)
 
 __all__ = [
     "Dedupe",
@@ -21,6 +26,9 @@ __all__ = [
     "StaticDedupe",
     "StaticGazetteer",
     "StaticRecordLink",
+    "StaticTemporalGazetteer",
+    "TemporalGazetteer",
+    "TemporalReference",
     "canonicalize",
     "console_label",
     "training_data_dedupe",

@@ -120,6 +120,76 @@ Library Documentation
     .. automethod:: score
     .. automethod:: many_to_n
 
+
+:class:`TemporalGazetteer` Objects
+----------------------------------
+Temporal gazetteers match messy records against reference data that change
+over time. Reference records are organized by business entity and by the
+time interval during which they were the valid version of that entity. Each
+query is matched at its own event time, so only reference versions valid at
+that point in time can produce candidates; a version that became valid
+later can never be selected over the version in effect when the event
+happened, even if the later version would score higher.
+
+.. autoclass:: dedupe.TemporalGazetteer
+
+    .. code:: python
+
+        import datetime
+        import dedupe
+        from dedupe import TemporalReference
+
+        variables = [dedupe.variables.String("name")]
+        matcher = dedupe.TemporalGazetteer(variables)
+
+        # {entity_id: {version_id: TemporalReference}}
+        reference = {
+            "cust-1": {
+                "v-old": TemporalReference(
+                    record={"name": "Acme Trading Co"},
+                    valid_from=datetime.datetime(2018, 1, 1),
+                    valid_to=datetime.datetime(2021, 1, 1),
+                ),
+                "v-new": TemporalReference(
+                    record={"name": "Acme Global"},
+                    valid_from=datetime.datetime(2021, 1, 1),
+                    valid_to=None,  # still the current version
+                ),
+            }
+        }
+        matcher.index(reference)
+
+        # An old order is matched against the version valid when the order
+        # was placed. Results carry both the entity id and the selected
+        # version id; records with no valid candidate are unmatched.
+        matcher.search(
+            {"order-99": {"name": "Acme Trading Co"}},
+            event_times=datetime.datetime(2020, 3, 1),
+        )
+        # [("order-99", (("cust-1", "v-old", 0.97),))]
+
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.index
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.unindex
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.search
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.blocks
+
+.. autoclass:: dedupe.TemporalReference
+    :members:
+
+:class:`StaticTemporalGazetteer` Objects
+----------------------------------------
+.. autoclass:: dedupe.StaticTemporalGazetteer
+
+    .. code:: python
+
+        with open('learned_settings', 'rb') as f:
+            matcher = dedupe.StaticTemporalGazetteer(f)
+
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.index
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.unindex
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.search
+    .. automethod:: dedupe.temporal.TemporalGazetteerMatching.blocks
+
 Lower Level Classes and Methods
 -------------------------------
 
