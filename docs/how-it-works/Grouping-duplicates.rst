@@ -49,3 +49,23 @@ developments are not compatible with Dedupe's pairwise approach. See,
 `Michael Wick, et.al, 2012. "A Discriminative Hierarchical Model for Fast Coreference at Large Scale" <http://people.cs.umass.edu/~sameer/files/hierar-coref-acl12.pdf>`__
 and `Rebecca C. Steorts, et. al., 2013. "A Bayesian Approach to Graphical Record Linkage and De-duplication" <http://arxiv.org/abs/1312.4645>`__.
 
+Cannot-link constraints
+-----------------------
+
+Sometimes you know in advance that two records can never belong to the
+same entity -- for example, two records that are known to belong to
+different business entities of the same corporate group. You can pass
+those pairs to :meth:`dedupe.Dedupe.partition` (or
+:meth:`dedupe.Dedupe.cluster`) with ``cannot_link``::
+
+    duplicates = matcher.partition(data, cannot_link=[(1, 2), (7, 9)])
+
+The constraint is applied while clusters are built, not by deleting a
+single similarity edge or by lowering the global ``threshold``. A pair
+listed in ``cannot_link`` will never appear together in any returned
+cluster, even when the two records would otherwise be connected
+indirectly through a third record. Ordinary records keep clustering
+exactly as they would without the argument, and records that cannot be
+joined to anything are returned as singletons.
+
+

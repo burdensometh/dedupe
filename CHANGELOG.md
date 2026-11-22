@@ -1,3 +1,11 @@
+# Unreleased
+- `Dedupe.partition` and `Dedupe.cluster` accept a `cannot_link` argument:
+  pairs of record ids that must never be placed in the same cluster. The
+  constraint is enforced during clustering (not by dropping a single
+  similarity edge or lowering the threshold), so forbidden records are
+  never joined even indirectly through a third record, while ordinary
+  pairs and singletons are preserved.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

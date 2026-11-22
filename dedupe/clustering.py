@@ -12,7 +12,14 @@ import numpy
 import numpy.typing
 import scipy.cluster.hierarchy
 
-from dedupe._typing import ArrayLinks, Clusters, RecordID, Scores, TupleLinks
+from dedupe._typing import (
+    ArrayLinks,
+    CannotLink,
+    Clusters,
+    RecordID,
+    Scores,
+    TupleLinks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +218,10 @@ def condensedDistance(
 
 
 def cluster(
-    dupes: Scores, threshold: float = 0.5, max_components: int = 30000
+    dupes: Scores,
+    threshold: float = 0.5,
+    max_components: int = 30000,
+    cannot_link: CannotLink | None = None,
 ) -> Clusters:
     """
     Takes in a list of duplicate pairs and clusters them in to a
@@ -222,9 +232,25 @@ def cluster(
     threshold -- number between 0 and 1 (default is .5). lowering the
                  number will increase precision, raising it will increase
                  recall
+    cannot_link -- an iterable of pairs of record ids that must never
+                   be assigned to the same cluster. The constraint is
+                   enforced while clusters are actually built: a merge
+                   that would place both members of a pair in the same
+                   cluster is refused, even if the two records would
+                   only be joined indirectly through other records.
+                   Records left without a partner are returned as
+                   usual (and, in :func:`dedupe.Dedupe.partition`, as
+                   singletons). Pairs whose ids are not part of this
+                   batch of scored pairs are ignored, since they can
+                   never share a cluster here.
     """
     distance_threshold = 1 - threshold
     dupe_sub_graphs = connected_components(dupes, max_components)
+
+    cannot_link_pairs = _normalize_cannot_link(cannot_link)
+    forbidden_ids: set[frozenset[RecordID]] = {
+        frozenset(pair) for pair in cannot_link_pairs
+    }
 
     for sub_graph in dupe_sub_graphs:
         if len(sub_graph) > 1:
@@ -243,16 +269,254 @@ def cluster(
             for i, cluster_id in enumerate(partition):
                 clusters[cluster_id].append(i)
 
+            forbidden = _component_cannot_link(cannot_link_pairs, i_to_id)
+
             squared_distances = condensed_distances**2
             for cluster in clusters.values():
                 if len(cluster) > 1:
-                    scores = confidences(cluster, squared_distances, N)
-                    yield tuple(i_to_id[i] for i in cluster), scores  # type: ignore[misc]
+                    if forbidden and _cluster_violates(cluster, forbidden):
+                        # limited-scope constrained re-merge: only
+                        # clusters that actually violate a constraint
+                        # are reconsidered; every other cluster is left
+                        # exactly as the ordinary algorithm produced it.
+                        groups = _constrained_merge(
+                            cluster,
+                            condensed_distances,
+                            N,
+                            distance_threshold,
+                            forbidden,
+                        )
+                    else:
+                        groups = [set(cluster)]
+
+                    for group in groups:
+                        if len(group) > 1:
+                            ordered = sorted(group)
+                            scores = confidences(ordered, squared_distances, N)
+                            record_ids = tuple(i_to_id[i] for i in ordered)
+                            yield record_ids, scores  # type: ignore[misc]
 
         else:
             ((ids, score),) = sub_graph
             if score > threshold:
+                normalized = frozenset(_normalize_record_id(i) for i in ids)
+                if normalized in forbidden_ids:
+                    # the only two records in this component are
+                    # explicitly forbidden: do not form a pair. partition
+                    # will emit them separately as singletons.
+                    continue
                 yield tuple(ids), (score,) * 2
+
+
+def _normalize_record_id(record_id: object) -> RecordID:
+    """Normalize a record id to a plain python ``int`` or ``str``.
+
+    Record ids read back out of the numpy structured arrays used by
+    dedupe can be numpy scalars (``numpy.bytes_`` or ``numpy.str_``)
+    rather than the python objects the caller supplied. Normalizing
+    both sides makes them comparable.
+    """
+    if isinstance(record_id, bytes):
+        return record_id.decode("utf-8", "surrogateescape")
+    if isinstance(record_id, str):
+        return record_id
+    if isinstance(record_id, numpy.integer):
+        return int(record_id)
+    return record_id  # type: ignore[return-value]
+
+
+def _normalize_cannot_link(
+    cannot_link: CannotLink | None,
+) -> list[tuple[RecordID, RecordID]]:
+    """Validate and canonicalize the supplied cannot-link pairs.
+
+    Policy for edge cases:
+
+    * A pair that names the same record twice is contradictory and
+      raises :class:`ValueError`.
+    * Anything that is not a two-element pair raises :class:`ValueError`.
+    * Repeated pairs, in either order, are collapsed.
+    * Ids that do not appear among the records being partitioned are
+      kept here but simply never match a cluster; see
+      :func:`_component_cannot_link`.
+    """
+    if not cannot_link:
+        return []
+
+    pairs: list[tuple[RecordID, RecordID]] = []
+    seen: set[frozenset[RecordID]] = set()
+    for pair in cannot_link:
+        try:
+            left, right = pair
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Every cannot_link constraint must be a pair of record ids, "
+                "got %r" % (pair,)
+            )
+
+        left = _normalize_record_id(left)
+        right = _normalize_record_id(right)
+
+        if left == right:
+            raise ValueError(
+                "A record cannot be constrained not to link to itself: %r" % (left,)
+            )
+
+        key = frozenset((left, right))
+        if key not in seen:
+            seen.add(key)
+            pairs.append((left, right))
+
+    return pairs
+
+
+def _component_cannot_link(
+    cannot_link: Sequence[tuple[RecordID, RecordID]],
+    i_to_id: dict[int, RecordID],
+) -> dict[int, set[int]]:
+    """Translate cannot-link pairs to the local indices used by one
+    connected component.
+
+    A pair with a member outside of this component cannot be violated
+    within it, so it is dropped: that is the explicit policy for unknown
+    / out-of-scope ids.
+    """
+    id_to_i: dict[RecordID, int] = {}
+    for i, record_id in i_to_id.items():
+        id_to_i.setdefault(_normalize_record_id(record_id), i)
+
+    forbidden: dict[int, set[int]] = {}
+    for left, right in cannot_link:
+        i = id_to_i.get(left)
+        j = id_to_i.get(right)
+        if i is None or j is None:
+            continue
+        forbidden.setdefault(i, set()).add(j)
+        forbidden.setdefault(j, set()).add(i)
+
+    return forbidden
+
+
+def _condensed_index(i: int, j: int, n: int) -> int:
+    """Index into scipy's condensed distance matrix.
+
+    ``i`` and ``j`` are local indices into ``i_to_id`` (as produced by
+    :func:`condensedDistance`) and must satisfy ``i < j``.
+    """
+    if i > j:
+        i, j = j, i
+    return i * (2 * n - i - 3) // 2 + j - 1
+
+
+def _cluster_violates(cluster: Sequence[int], forbidden: dict[int, set[int]]) -> bool:
+    members = set(cluster)
+    for record in cluster:
+        partners = forbidden.get(record)
+        if partners is not None and not partners.isdisjoint(members):
+            return True
+    return False
+
+
+def _constrained_merge(
+    members: Sequence[int],
+    condensed_distances: numpy.typing.NDArray[numpy.float64],
+    n: int,
+    distance_threshold: float,
+    forbidden: dict[int, set[int]],
+) -> list[set[int]]:
+    """Agglomeratively re-cluster one already-formed cluster so that no
+    forbidden pair ends up in the same output cluster.
+
+    This is only run on the *limited scope* of a cluster that already
+    violates a constraint; every other cluster is emitted untouched.
+    Within that scope, clusters are merged nearest-first using centroid
+    linkage (matching :func:`dedupe.clustering.cluster`), except that a
+    merge is skipped whenever it would put a forbidden pair together.
+    The merge that is chosen instead is the nearest *allowed* one, which
+    is what keeps ordinary paths (e.g. ``b--c`` when ``a--b`` is
+    forbidden) intact instead of discarding the whole area.
+
+    Because a forbidden pair is never merged, and every member is
+    assigned to exactly one output cluster, the result guarantees that
+    no output cluster contains both members of a forbidden pair.
+    Returns sets of the original local indices.
+    """
+    ordered = sorted(members)
+    k = len(ordered)
+    position = {record: i for i, record in enumerate(ordered)}
+
+    # centroid linkage is defined on *squared* distances (Lance-Williams
+    # below), while the threshold and the reported distances are plain
+    # distances, so we keep squared distances and take square roots when
+    # comparing against the threshold.
+    squared = numpy.zeros((k, k), dtype=numpy.float64)
+    for a in range(k):
+        for b in range(a + 1, k):
+            distance = condensed_distances[
+                _condensed_index(ordered[a], ordered[b], n)
+            ]
+            squared[a, b] = squared[b, a] = float(distance) ** 2
+
+    forbidden_positions: list[set[int]] = [set() for _ in range(k)]
+    for a, record in enumerate(ordered):
+        for partner in forbidden.get(record, ()):
+            b = position.get(partner)
+            if b is not None:
+                forbidden_positions[a].add(b)
+
+    clusters: dict[int, set[int]] = {i: {i} for i in range(k)}
+    sizes: dict[int, int] = {i: 1 for i in range(k)}
+    active: set[int] = set(range(k))
+
+    def violates(left: int, right: int) -> bool:
+        smaller, larger = clusters[left], clusters[right]
+        if len(smaller) > len(larger):
+            smaller, larger = larger, smaller
+        for record in smaller:
+            if not forbidden_positions[record].isdisjoint(larger):
+                return True
+        return False
+
+    while len(active) > 1:
+        best: tuple[int, int] | None = None
+        best_squared = numpy.inf
+        ids = sorted(active)
+        for a_index in range(len(ids)):
+            left = ids[a_index]
+            for b_index in range(a_index + 1, len(ids)):
+                right = ids[b_index]
+                if violates(left, right):
+                    continue
+                value = squared[left, right]
+                if value < best_squared:
+                    best_squared = value
+                    best = (left, right)
+
+        if best is None or numpy.sqrt(best_squared) > distance_threshold:
+            break
+
+        left, right = best
+        left_size = sizes[left]
+        right_size = sizes[right]
+        merged_size = left_size + right_size
+        correction = (left_size * right_size) / (merged_size * merged_size)
+
+        for other in active:
+            if other == left or other == right:
+                continue
+            updated = (
+                left_size * squared[left, other]
+                + right_size * squared[right, other]
+            ) / merged_size - correction * best_squared
+            squared[left, other] = squared[other, left] = updated
+
+        clusters[left] |= clusters[right]
+        sizes[left] = merged_size
+        del clusters[right]
+        del sizes[right]
+        active.discard(right)
+
+    return [{ordered[p] for p in group} for group in clusters.values()]
 
 
 def confidences(

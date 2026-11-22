@@ -114,5 +114,67 @@ class ActiveMatch(unittest.TestCase):
             assert str(w[-1].message) == "Didn't return any labeled record pairs"
 
 
+class _StubbedDedupe(dedupe.api.DedupeMatching):
+    """A DedupeMatching whose pair generation and scoring are fixed, so
+    partition() can be exercised without training a model."""
+
+    def __init__(self, scored_pairs):  # noqa: D401 - test helper
+        self.scored_pairs = scored_pairs
+
+    def pairs(self, data):
+        return iter(())
+
+    def score(self, pairs):
+        import numpy
+
+        pairs = list(self.scored_pairs)
+        return numpy.array(pairs, dtype=[("pairs", "i4", 2), ("score", "f4")])
+
+
+class PartitionCannotLink(unittest.TestCase):
+    def setUp(self):
+        # At threshold 0.5, {1, 2, 3} cluster together, as do {4, 5}.
+        self.scored_pairs = [
+            ((1, 2), 0.86),
+            ((1, 3), 0.72),
+            ((2, 3), 0.86),
+            ((4, 5), 0.72),
+        ]
+        self.data = {i: {"name": str(i)} for i in (1, 2, 3, 4, 5, 6)}
+
+    def test_partition_without_constraint(self):
+        matcher = _StubbedDedupe(self.scored_pairs)
+        clusters = dict(matcher.partition(self.data, threshold=0.5))
+        assert (1, 2, 3) in clusters
+        assert (4, 5) in clusters
+
+    def test_partition_with_cannot_link(self):
+        matcher = _StubbedDedupe(self.scored_pairs)
+        clusters = matcher.partition(
+            self.data, threshold=0.5, cannot_link=[(1, 2)]
+        )
+        for record_ids, _ in clusters:
+            assert not (1 in record_ids and 2 in record_ids)
+
+        partitioned = {
+            record_id for record_ids, _ in clusters for record_id in record_ids
+        }
+        # every record is still accounted for, unmerged ones as singletons
+        assert partitioned == set(self.data)
+        assert (4, 5) in {c[0] for c in clusters}
+
+    def test_partition_transitive_cannot_link(self):
+        scored_pairs = [((1, 2), 0.9), ((2, 3), 0.9)]
+        matcher = _StubbedDedupe(scored_pairs)
+        clusters = matcher.partition(self.data, threshold=0.5, cannot_link=[(1, 3)])
+        for record_ids, _ in clusters:
+            assert not (1 in record_ids and 3 in record_ids)
+
+    def test_partition_self_pair_raises(self):
+        matcher = _StubbedDedupe(self.scored_pairs)
+        with self.assertRaises(ValueError):
+            matcher.partition(self.data, threshold=0.5, cannot_link=[(1, 1)])
+
+
 if __name__ == "__main__":
     unittest.main()

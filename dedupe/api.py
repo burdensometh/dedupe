@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         Blocks,
         BlocksInt,
         BlocksStr,
+        CannotLink,
         Classifier,
         Clusters,
         ClustersInt,
@@ -138,17 +139,23 @@ class DedupeMatching(IntegralMatching):
 
     @overload
     def partition(
-        self, data: DataInt, threshold: float = 0.5
+        self,
+        data: DataInt,
+        threshold: float = 0.5,
+        cannot_link: CannotLink | None = None,
     ) -> ClustersInt:  # pragma: no cover
         ...
 
     @overload
     def partition(
-        self, data: DataStr, threshold: float = 0.5
+        self,
+        data: DataStr,
+        threshold: float = 0.5,
+        cannot_link: CannotLink | None = None,
     ) -> ClustersStr:  # pragma: no cover
         ...
 
-    def partition(self, data, threshold=0.5):  # pragma: no cover
+    def partition(self, data, threshold=0.5, cannot_link=None):  # pragma: no cover
         """
         Identifies records that all refer to the same entity, returns
         tuples containing a sequence of record ids and corresponding
@@ -177,6 +184,34 @@ class DedupeMatching(IntegralMatching):
                        Lowering the number will increase recall,
                        raising it will increase precision
 
+            cannot_link: An iterable of pairs of record ids that must
+                       never be assigned to the same cluster, for
+                       example records that belong to different
+                       business entities of the same corporate group.
+                       Each pair is a 2-tuple of ids, and the pair may
+                       be given in either order.
+
+                       The constraint is applied while clusters are
+                       formed, not by dropping a single similarity
+                       edge: if records ``a`` and ``b`` are forbidden
+                       from linking, they will never share a cluster,
+                       even when they would otherwise be connected
+                       indirectly through a third record ``c``. Normal,
+                       unconstrained records keep clustering exactly as
+                       they would without this argument, and records
+                       that cannot be joined to anything remain
+                       singletons. The global ``threshold`` is left
+                       untouched.
+
+                       Conflicts and unknown ids are handled explicitly:
+
+                       * ``cannot_link`` pairs that repeat the same
+                         record id (``a, a``) are contradictory and
+                         raise :class:`ValueError`.
+                       * Ids that do not occur in ``data`` are ignored,
+                         because such a pair can never share a cluster
+                         in this call.
+
         Examples:
             >>> duplicates = matcher.partition(data, threshold=0.5)
             >>> duplicates
@@ -185,10 +220,11 @@ class DedupeMatching(IntegralMatching):
                 ((4, 5), (0.720, 0.720)),
                 ((10, 11), (0.899, 0.899)),
             ]
+            >>> duplicates = matcher.partition(data, cannot_link=[(1, 2)])
         """
         pairs = self.pairs(data)
         pair_scores = self.score(pairs)
-        clusters = self.cluster(pair_scores, threshold)
+        clusters = self.cluster(pair_scores, threshold, cannot_link=cannot_link)
         clusters = self._add_singletons(data.keys(), clusters)
         clusters_eval = list(clusters)
         _cleanup_scores(pair_scores)
@@ -296,7 +332,12 @@ class DedupeMatching(IntegralMatching):
             pairs.close()
             con.close()
 
-    def cluster(self, scores: Scores, threshold: float = 0.5) -> Clusters:
+    def cluster(
+        self,
+        scores: Scores,
+        threshold: float = 0.5,
+        cannot_link: CannotLink | None = None,
+    ) -> Clusters:
         r"""From the similarity scores of pairs of records, decide which groups
         of records are all referring to the same entity.
 
@@ -344,6 +385,12 @@ class DedupeMatching(IntegralMatching):
                        Lowering the number will increase recall,
                        raising it will increase precision
 
+            cannot_link: An iterable of pairs of record ids that must
+                       never be placed in the same cluster. See
+                       :meth:`dedupe.Dedupe.partition` for the exact
+                       semantics and how conflicting or unknown ids are
+                       handled.
+
         Examples:
             >>> pairs = matcher.pairs(data)
             >>> scores = matcher.scores(pairs)
@@ -359,7 +406,7 @@ class DedupeMatching(IntegralMatching):
 
         logger.debug("matching done, begin clustering")
 
-        yield from clustering.cluster(scores, threshold)
+        yield from clustering.cluster(scores, threshold, cannot_link=cannot_link)
 
 
 class RecordLinkMatching(IntegralMatching):
