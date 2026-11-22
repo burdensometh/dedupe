@@ -21,6 +21,7 @@ from dedupe._typing import (
 )
 from dedupe.canonical import getCanonicalRep
 from dedupe.core import unique
+from dedupe.missing import record_value
 
 IndicesIterator = Iterator[Tuple[int, int]]
 
@@ -161,7 +162,7 @@ def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cov
 
         for record in record_pair:
             for field in fields:
-                line = f"{field} : {record[field]}"
+                line = f"{field} : {record_value(record, field)}"
                 _print(line)
             _print()
         _print(f"{n_match}/10 positive, {n_distinct}/10 negative")

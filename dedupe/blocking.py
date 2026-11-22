@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from dedupe.missing import record_value
+
 if TYPE_CHECKING:
     from typing import (
         Any,
@@ -188,7 +190,11 @@ class Fingerprinter:
 
     def index_all(self, data: Data) -> None:
         for field in self.index_fields:
-            unique_fields = {record[field] for record in data.values() if record[field]}
+            unique_fields = {
+                record_value(record, field)
+                for record in data.values()
+                if record_value(record, field)
+            }
             self.index(unique_fields, field)
 
 

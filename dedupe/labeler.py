@@ -12,6 +12,7 @@ import sklearn.linear_model
 
 import dedupe.core as core
 import dedupe.training as training
+from dedupe.missing import record_value
 
 if TYPE_CHECKING:
     from typing import Iterable, Literal, Mapping
@@ -251,7 +252,7 @@ class DedupeBlockLearner(BlockLearner):
         records = core.unique(record for pair in candidates for record in pair)
 
         for field in blocker.index_fields:
-            unique_fields = {record[field] for record in records}
+            unique_fields = {record_value(record, field) for record in records}
             blocker.index(unique_fields, field)
 
         for pred in blocker.index_predicates:
@@ -312,7 +313,7 @@ class RecordLinkBlockLearner(BlockLearner):
         B = core.unique(B_full)
 
         for field in blocker.index_fields:
-            unique_fields = {record[field] for record in B}
+            unique_fields = {record_value(record, field) for record in B}
             blocker.index(unique_fields, field)
 
         for pred in blocker.index_predicates:

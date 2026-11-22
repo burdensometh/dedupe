@@ -1,3 +1,14 @@
+# 3.0.4
+- Fields declared with `has_missing=True` now use a comparison-feature contract
+  that distinguishes a field that was *not provided* (omitted key or `None`), a
+  field that was *provided but empty* (`''`, empty set, ...), and a field that
+  is *comparable*. Each pair state is a separate one-hot feature, so a record
+  with no address is never confused with an empty address, and neither is
+  confused with two identical non-empty values. Interaction variables that
+  contain a declared-missing field follow the same contract. Existing saved
+  models keep the previous single "both present" indicator and their original
+  feature dimensions when reloaded.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

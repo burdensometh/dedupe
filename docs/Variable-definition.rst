@@ -341,9 +341,9 @@ To install:
     pip install dedupe-variable-name
 
 
-Missing Data 
------------- 
-If the value of field is missing, that missing value should be represented as 
+Missing Data
+------------
+If the value of field is missing, that missing value should be represented as
 a ``None`` object. You should also use ``None`` to represent empty strings
 (eg ``''``).
 
@@ -356,9 +356,27 @@ a ``None`` object. You should also use ``None`` to represent empty strings
    ]
 
 If you want to model this missing data for a field, you can set the ``has
-missing=True`` in the variable definition. This creates a new,
-additional field representing whether the data was present or not and
-zeros out the missing data.
+missing=True`` in the variable definition. A field declared this way gets a
+comparison-feature block that distinguishes three ways a record can present
+the field:
+
+- **not provided** — the record has no key for the field at all. This is the
+  usual case for a source whose schema has no such field;
+- **provided but empty** — the record carries the key, but its value is blank
+  (``None``, ``''``, an empty set, an empty sequence, ...);
+- **comparable** — the record carries a value that can be fed to the field
+  comparator.
+
+These three cases are kept distinct from each other and from a genuine
+comparison whose distance happens to be zero. So a record from a source that
+has no address field is never treated as if its address matched an empty
+address in another record, and neither is confused with two real addresses
+that are identical. When a field is declared with ``has_missing=True``, its
+key may be omitted from a record entirely to mean "not provided".
+
+Because the contract keeps three separate states, the comparison-feature block
+is wider than the single "both present" indicator used by older models. The
+extra width is the only change to feature dimensions.
 
 If there is missing data, but you did not declare ``has
 missing=True`` then the missing data will simply be zeroed out and
@@ -379,7 +397,16 @@ This approach makes a few assumptions that are usually not completely true:
 
 If you define an an interaction with a field that you declared to have
 missing data, then ``has missing=True`` will also be set for the
-Interaction field.
+Interaction field. Interactions follow the same comparison-feature contract:
+the state of an interaction is the most severe state among its constituent
+fields, so an interaction whose address is absent is kept distinct from one
+whose address is provided but empty.
+
+Models saved by earlier versions of dedupe keep the older contract when they
+are reloaded: they continue to use a single "both present" indicator per
+declared field and the original feature dimensions. You do not have to
+re-train an existing model, and dedupe never invents a value to fill in a
+blank or absent field.
 
 Longer example of a variable definition:
 

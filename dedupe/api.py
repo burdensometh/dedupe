@@ -26,6 +26,7 @@ import dedupe.datamodel as datamodel
 import dedupe.labeler as labeler
 import dedupe.predicates
 import dedupe.serializer as serializer
+from dedupe.missing import record_value
 
 if TYPE_CHECKING:
     from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, TextIO
@@ -759,7 +760,7 @@ class GazetteerMatching(Matching):
 
         for field in self.fingerprinter.index_fields:
             self.fingerprinter.unindex(
-                {record[field] for record in data.values()}, field
+                {record_value(record, field) for record in data.values()}, field
             )
 
         con = sqlite3.connect(self.db)

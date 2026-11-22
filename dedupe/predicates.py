@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import dedupe.levenshtein as levenshtein
 import dedupe.tfidf as tfidf
 from dedupe.cpredicates import ngrams
+from dedupe.missing import record_value
 
 # This allows to import predicate functions from this module
 # and ensure backward compatibility.
@@ -87,7 +88,7 @@ class SimplePredicate(Predicate):
         self.field = field
 
     def __call__(self, record: RecordDict, **kwargs) -> frozenset[str]:
-        column = record[self.field]
+        column = record_value(record, self.field)
         if column:
             return self.func(column)
         else:
@@ -96,7 +97,7 @@ class SimplePredicate(Predicate):
 
 class StringPredicate(SimplePredicate):
     def __call__(self, record: RecordDict, **kwargs) -> frozenset[str]:
-        column: str = record[self.field]
+        column: str = record_value(record, self.field)
         if column:
             return self.func(" ".join(strip_punc(column).split()))
         else:
@@ -118,7 +119,7 @@ class ExistsPredicate(Predicate):
             return frozenset(("0",))
 
     def __call__(self, record: RecordDict, **kwargs) -> frozenset[Literal["0", "1"]]:  # type: ignore
-        column = record[self.field]
+        column = record_value(record, self.field)
         return self.func(column)
 
 
@@ -169,7 +170,9 @@ class CanopyPredicate(IndexPredicate):
         self._cache = {}
 
     def freeze(self, records: Iterable[RecordDict]) -> None:
-        self._cache = {record[self.field]: self(record) for record in records}
+        self._cache = {
+            record_value(record, self.field): self(record) for record in records
+        }
         self.canopy = {}
         self.index = None
 
@@ -180,7 +183,7 @@ class CanopyPredicate(IndexPredicate):
 
     def __call__(self, record: RecordDict, **kwargs) -> frozenset[str]:
         block_key = None
-        column = record[self.field]
+        column = record_value(record, self.field)
 
         if column:
             if column in self._cache:
@@ -230,10 +233,14 @@ class SearchPredicate(IndexPredicate):
         self, records_1: Iterable[RecordDict], records_2: Iterable[RecordDict]
     ) -> None:
         self._cache = {
-            (record[self.field], False): self(record, False) for record in records_1
+            (record_value(record, self.field), False): self(record, False)
+            for record in records_1
         }
         self._cache.update(
-            {(record[self.field], True): self(record, True) for record in records_2}
+            {
+                (record_value(record, self.field), True): self(record, True)
+                for record in records_2
+            }
         )
         self.index = None
 
@@ -244,7 +251,7 @@ class SearchPredicate(IndexPredicate):
     def __call__(
         self, record: RecordDict, target: bool = False, **kwargs
     ) -> frozenset[str]:
-        column = record[self.field]
+        column = record_value(record, self.field)
         if column:
             if (column, target) in self._cache:
                 return self._cache[(column, target)]
