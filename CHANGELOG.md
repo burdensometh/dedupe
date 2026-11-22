@@ -1,3 +1,14 @@
+# Unreleased
+- Added optional, resumable labeling sessions. `uncertain_pairs` and
+  `mark_pairs` accept a `session_file` argument that records the pairs shown to
+  the user and the labels they supplied, bound to the stable record ids of both
+  sides and to a fingerprint of the input data. `resume_session` restores
+  completed labels into the training data and re-offers the pair that was shown
+  but not answered when a process was interrupted. Re-submitting a label is
+  idempotent, changes are kept in the session history, and contradictory labels
+  warn instead of silently replacing the earlier value. Existing training files
+  are still read unchanged.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

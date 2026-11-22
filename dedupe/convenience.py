@@ -106,7 +106,11 @@ def _print(*args) -> None:
 LabeledPair = Tuple[RecordDictPair, Literal["match", "distinct", "unsure"]]
 
 
-def _mark_pair(deduper: dedupe.api.ActiveMatching, labeled_pair: LabeledPair) -> None:
+def _mark_pair(
+    deduper: dedupe.api.ActiveMatching,
+    labeled_pair: LabeledPair,
+    session_file=None,
+) -> None:
     record_pair, label = labeled_pair
     examples: TrainingData = {"distinct": [], "match": []}
     if label == "unsure":
@@ -116,10 +120,12 @@ def _mark_pair(deduper: dedupe.api.ActiveMatching, labeled_pair: LabeledPair) ->
     else:
         # label is either "match" or "distinct"
         examples[label].append(record_pair)
-    deduper.mark_pairs(examples)
+    deduper.mark_pairs(examples, session_file=session_file)
 
 
-def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cover
+def console_label(
+    deduper: dedupe.api.ActiveMatching, session_file=None
+) -> None:  # pragma: no cover
     """
     Train a matcher instance (Dedupe, RecordLink, or Gazetteer) from the command line.
     Example
@@ -129,6 +135,12 @@ def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cov
        > deduper = dedupe.Dedupe(variables)
        > deduper.prepare_training(data)
        > dedupe.console_label(deduper)
+
+    If ``session_file`` is provided (a path or writable text file object), the
+    labeling session is saved as you go. If the process is interrupted, simply
+    run the same command again with the same session file and the labels that
+    were already supplied will be picked back up, along with any pair that was
+    on screen when the process stopped.
     """
 
     finished = False
@@ -142,6 +154,13 @@ def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cov
     n_match = len(deduper.training_pairs["match"])
     n_distinct = len(deduper.training_pairs["distinct"])
 
+    if session_file is not None:
+        # Re-apply labels and re-offer the pair that was on screen when a
+        # previous run stopped.
+        deduper.resume_session(session_file)
+        n_match = len(deduper.training_pairs["match"])
+        n_distinct = len(deduper.training_pairs["distinct"])
+
     while not finished:
         if use_previous:
             record_pair, label = labeled.pop(0)
@@ -153,7 +172,7 @@ def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cov
         else:
             try:
                 if not unlabeled:
-                    unlabeled = deduper.uncertain_pairs()
+                    unlabeled = deduper.uncertain_pairs(session_file=session_file)
 
                 record_pair = unlabeled.pop()
             except IndexError:
@@ -196,10 +215,10 @@ def console_label(deduper: dedupe.api.ActiveMatching) -> None:  # pragma: no cov
             unlabeled.append(record_pair)
 
         while len(labeled) > buffer_len:
-            _mark_pair(deduper, labeled.pop())
+            _mark_pair(deduper, labeled.pop(), session_file=session_file)
 
     for labeled_pair in labeled:
-        _mark_pair(deduper, labeled_pair)
+        _mark_pair(deduper, labeled_pair, session_file=session_file)
 
 
 @overload

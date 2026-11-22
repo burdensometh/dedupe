@@ -19,6 +19,7 @@ Library Documentation
 
     .. automethod:: prepare_training
     .. automethod:: uncertain_pairs
+    .. automethod:: resume_session
     .. automethod:: mark_pairs
     .. automethod:: train
     .. automethod:: write_training
@@ -57,6 +58,7 @@ Library Documentation
 
     .. automethod:: prepare_training
     .. automethod:: uncertain_pairs
+    .. automethod:: resume_session
     .. automethod:: mark_pairs
     .. automethod:: train
     .. automethod:: write_training
@@ -94,6 +96,7 @@ Library Documentation
 
     .. automethod:: prepare_training
     .. automethod:: uncertain_pairs
+    .. automethod:: resume_session
     .. automethod:: mark_pairs
     .. automethod:: train
     .. automethod:: write_training
@@ -261,3 +264,48 @@ Convenience Functions
 .. autofunction:: dedupe.canonicalize
 .. autofunction:: dedupe.read_training
 .. autofunction:: dedupe.write_training
+
+
+Labeling Sessions
+-----------------
+
+Pass ``session_file`` to :meth:`Dedupe.uncertain_pairs` and
+:meth:`Dedupe.mark_pairs` (or :meth:`RecordLink` / :meth:`Gazetteer`) to save
+an interactive labeling session as you go. If the labeling program is
+interrupted, call :meth:`Dedupe.resume_session` with the same file after
+:meth:`Dedupe.prepare_training`: completed labels are added to the training
+data, and the pair that was on screen when the process stopped is offered
+again.
+
+.. code:: python
+
+    matcher = dedupe.Dedupe(variables)
+    matcher.prepare_training(data)
+
+    # pass a session file on every interactive call
+    pair = matcher.uncertain_pairs(session_file='labeling.json')[0]
+    matcher.mark_pairs({"match": [pair], "distinct": []},
+                       session_file='labeling.json')
+
+After a crash::
+
+    matcher = dedupe.Dedupe(variables)
+    matcher.prepare_training(data)
+    matcher.resume_session('labeling.json')
+    # ... continue labeling with the same session file
+
+The session is bound to the exact input data the labels were made against
+(record ids and values, and the ordered field names). Resuming against
+different data raises :class:`dedupe.SessionMismatchError` rather than
+silently applying labels to the wrong records. Changing a label is recorded
+in the session history; a directly contradictory label raises
+:class:`dedupe.SessionConflictWarning` and is not applied silently.
+Re-submitting the same label is idempotent.
+
+.. autoclass:: dedupe.session.LabelingSession
+   :members: resolved, history
+
+.. autoexception:: dedupe.SessionMismatchError
+.. autoexception:: dedupe.SessionFileLoadingException
+.. autoexception:: dedupe.SessionConflictWarning
+.. autoexception:: dedupe.SessionDataWarning

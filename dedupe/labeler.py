@@ -344,6 +344,8 @@ class DisagreementLearner(HasCandidates):
         self.y: numpy.typing.NDArray[numpy.int_] = numpy.array([])
         self.pairs: TrainingExamples = []
         self.rng = numpy.random.default_rng()
+        self._bootstrap_pairs: TrainingExamples = []
+        self._bootstrap_y: numpy.typing.NDArray[numpy.int_] = numpy.array([])
 
     def pop(self) -> TrainingExample:
         if not (n_candidates := len(self.candidates)):
@@ -412,6 +414,23 @@ class DisagreementLearner(HasCandidates):
         for learner in self._learners:
             learner.fit(self.pairs, self.y)
 
+    def reset(self, pairs: TrainingExamples, y: LabelsLike) -> None:
+        """Replace all labels (except the internal bootstrap examples) and refit.
+
+        This is used when a previously recorded label is changed. Without it,
+        the old and new label would both remain in the learner's history.
+        """
+        y_array = numpy.asarray(list(y), dtype=numpy.int_)
+        self.pairs = list(self._bootstrap_pairs) + list(pairs)
+        self.y = numpy.concatenate([self._bootstrap_y, y_array]).astype(numpy.int_)
+        for learner in self._learners:
+            learner.fit(self.pairs, self.y)
+
+    def _capture_bootstrap(self) -> None:
+        """Remember the synthetic examples added at construction time."""
+        self._bootstrap_pairs = list(self.pairs)
+        self._bootstrap_y = self.y.copy()
+
     def learn_predicates(
         self, recall: float, index_predicates: bool
     ) -> tuple[Predicate, ...]:
@@ -450,6 +469,7 @@ class DedupeDisagreementLearner(DisagreementLearner):
         examples = [exact_match] * 4 + [random_pair]
         labels: Labels = [1] * 4 + [0]  # type: ignore[assignment]
         self.mark(examples, labels)
+        self._capture_bootstrap()
 
 
 class RecordLinkDisagreementLearner(DisagreementLearner):
@@ -486,6 +506,7 @@ class RecordLinkDisagreementLearner(DisagreementLearner):
         examples = [exact_match] * 4 + [random_pair]
         labels: Labels = [1] * 4 + [0]  # type: ignore[assignment]
         self.mark(examples, labels)
+        self._capture_bootstrap()
 
 
 def sample_records(data: Mapping, sample_size: int) -> dict:

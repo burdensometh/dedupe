@@ -13,6 +13,12 @@ from dedupe.convenience import (  # noqa: F401
     training_data_link,
 )
 from dedupe.serializer import read_training, write_training  # noqa: F401
+from dedupe.session import (  # noqa: F401
+    SessionConflictWarning,
+    SessionDataWarning,
+    SessionFileLoadingException,
+    SessionMismatchError,
+)
 
 __all__ = [
     "Dedupe",
@@ -27,4 +33,8 @@ __all__ = [
     "training_data_link",
     "read_training",
     "write_training",
+    "SessionConflictWarning",
+    "SessionDataWarning",
+    "SessionFileLoadingException",
+    "SessionMismatchError",
 ]

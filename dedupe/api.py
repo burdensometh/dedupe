@@ -26,6 +26,7 @@ import dedupe.datamodel as datamodel
 import dedupe.labeler as labeler
 import dedupe.predicates
 import dedupe.serializer as serializer
+import dedupe.session as session_io
 
 if TYPE_CHECKING:
     from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, TextIO
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
         TupleLinks,
         Variable,
     )
+    from dedupe.session import SessionFile
 
 logger = logging.getLogger(__name__)
 
@@ -1148,12 +1150,280 @@ class ActiveMatching(Matching):
         )
         self.active_learner = None
 
+        # Interactive labeling session. These attributes are only populated
+        # once a session file is supplied; without one the behavior of
+        # `uncertain_pairs` and `mark_pairs` is unchanged.
+        self.session: session_io.LabelingSession | None = None
+        self._session_mode = "dedupe"
+        self._session_data: list[Mapping] | None = None
+        self._resolver: session_io.RecordResolver | None = None
+        self._training_index: dict[str, str] | None = None
+        self._promoted: set[str] = set()
+
+    def _field_schema(self) -> list[str]:
+        return [variable.field for variable in self.data_model.field_variables]
+
+    def _set_session_input(
+        self, mode: Literal["dedupe", "link"], datasets: list[Mapping]
+    ) -> None:
+        """Remember the data a session should be bound to.
+
+        This is deliberately separate from attaching a session so that a
+        training file can be read first without being recorded as manual
+        labels. The record index is built lazily, only once a session is
+        actually used, so callers that never pass a session file pay nothing.
+        """
+        self._session_mode = mode
+        self._session_data = datasets
+        self._resolver = None
+
+    def _resolver_or_none(self) -> session_io.RecordResolver | None:
+        if self._resolver is None and self._session_data is not None:
+            self._resolver = session_io.RecordResolver(
+                self._session_data, self._field_schema()
+            )
+        return self._resolver
+
+    def _reset_session(self) -> None:
+        self.session = None
+        self._resolver = None
+        self._training_index = None
+        self._promoted = set()
+
+    # -- session plumbing --------------------------------------------
+
+    def _key_for_records(self, records: tuple) -> str:
+        resolver = self._resolver_or_none()
+        if resolver is not None:
+            return resolver.key_for_pair(records, self._session_mode)
+        return session_io.pair_content_key(records, self._session_mode)
+
+    def _ids_for_records(self, records: tuple) -> tuple | None:
+        resolver = self._resolver_or_none()
+        if resolver is None:
+            return None
+        return resolver.ids_for_pair(records, self._session_mode)
+
+    def _records_for_event(self, event: Mapping) -> tuple | None:
+        ids = event.get("ids")
+        resolver = self._resolver_or_none()
+        if ids and resolver is not None:
+            records = resolver.records_for_ids(ids, self._session_mode)
+            if records is not None:
+                return records
+        stored = event.get("records")
+        if stored is not None:
+            decoded = session_io.decode_records(stored)
+            if decoded is not None:
+                return decoded
+        return None
+
+    def _attach_session(
+        self, session_file: SessionFile | None
+    ) -> session_io.LabelingSession | None:
+        """Open ``session_file`` (if needed) and replay its completed labels."""
+        if session_file is None:
+            return self.session
+
+        if self.session is not None and session_io.source_matches(
+            self.session.source, session_file
+        ):
+            return self.session
+
+        fingerprint = None
+        if self._session_data is not None:
+            fingerprint = session_io.data_fingerprint(
+                self._session_data, self._field_schema()
+            )
+
+        session = session_io.open_session(
+            session_file, self._session_mode, fingerprint
+        )
+        self.session = session
+        self._promoted = set()
+        self._rebuild_training_index()
+
+        restored = self._replay_session(session)
+        if self.active_learner is not None and restored:
+            self._refit_active_learner()
+
+        if session.dirty:
+            session.save()
+        return session
+
+    def _rebuild_training_index(self) -> None:
+        # The index is only needed while a session is attached. Skipping it
+        # otherwise keeps `prepare_training` cheap for large datasets.
+        if self.session is None:
+            self._training_index = None
+            return
+
+        index: dict[str, str] = {}
+        for label in ("match", "distinct"):
+            for pair in self.training_pairs[label]:
+                key = self._key_for_records(tuple(pair))
+                previous = index.get(key)
+                if previous is not None and previous != label:
+                    index[key] = "unsure"
+                else:
+                    index[key] = label
+        self._training_index = index
+
+    def _replay_session(
+        self, session: session_io.LabelingSession
+    ) -> int:
+        """Apply the session's latest label for each pair to the training set.
+
+        Returns the number of events that were applied.
+        """
+        applied = 0
+        for event in session.resolved():
+            records = self._records_for_event(event)
+            if records is None:
+                warnings.warn(
+                    "A stored label could not be matched to a record pair in the "
+                    "current input data and was skipped: "
+                    f"{event.get('pair')!r}.",
+                    session_io.SessionDataWarning,
+                )
+                continue
+
+            # The session already warned when a contradictory label was
+            # recorded among its own events. Here the only possible conflict is
+            # with a label from a training file, so surface that too.
+            if self._upsert_training(records, event["label"], warn_conflict=True):
+                applied += 1
+
+        return applied
+
+    def _refit_active_learner(self) -> None:
+        """Rebuild the active learner's history from ``self.training_pairs``."""
+        if self.active_learner is None:
+            return
+        examples, y = flatten_training(self.training_pairs)
+        try:
+            self.active_learner.reset(examples, y)
+        except dedupe.predicates.NoIndexError as e:
+            warnings.warn(
+                "The record\n"
+                f"{e.failing_record}\n"
+                "is not known to the active learner. Make sure all labeled "
+                "pairs are in the data or training file of the "
+                "`prepare_training()` method",
+                UserWarning,
+            )
+
+    def _upsert_training(
+        self, records: tuple, label: str, warn_conflict: bool
+    ) -> bool:
+        """Add or replace a labeled pair in the training set.
+
+        Returns True when the training set changed.
+        """
+        key = self._key_for_records(records)
+        index = self._training_index
+        existing = index.get(key) if index is not None else None
+
+        if existing == label:
+            return False
+
+        if existing is not None:
+            self._remove_training_key(key)
+            if warn_conflict and {existing, label} == {"match", "distinct"}:
+                self._conflict_warning(records, existing, label)
+
+        self._add_training_records(records, label)
+        if index is not None:
+            index[key] = label
+        return True
+
+    def _add_training_records(self, records: tuple, label: str) -> None:
+        pair = records  # type: ignore[assignment]
+        if label in ("match", "unsure"):
+            self.training_pairs["match"].append(pair)
+        if label in ("distinct", "unsure"):
+            self.training_pairs["distinct"].append(pair)
+
+    def _remove_training_key(self, key: str) -> None:
+        for label in ("match", "distinct"):
+            kept = [
+                pair
+                for pair in self.training_pairs[label]
+                if self._key_for_records(tuple(pair)) != key
+            ]
+            self.training_pairs[label] = kept
+
+    @staticmethod
+    def _conflict_warning(records: tuple, previous: str, label: str) -> None:
+        message = (
+            f"Conflicting labels for record pair {records!r}: "
+            f"{previous!r} was already recorded and is now {label!r}. "
+            "The change is kept in the training session history."
+        )
+        logger.warning(message)
+        warnings.warn(message, session_io.SessionConflictWarning)
+
+    def _pending_examples(self) -> TrainingExamples:
+        """Return a pair that was shown but not answered, if there is one.
+
+        Pairs restored from disk are offered before any new pair, so a pair
+        that was on screen when a previous process stopped is shown again.
+        Within one process each pending pair is offered once; if the caller
+        never labels it, it stays pending on disk for the next resume.
+        """
+        if self.session is None:
+            return []
+
+        for entry in list(self.session.pending):
+            key = entry.get("pair")
+            if key in self._promoted:
+                continue
+            records = self._records_for_event(entry)
+            if records is None:
+                warnings.warn(
+                    "An unlabeled pair from the labeling session could not be "
+                    "matched to records in the current input data and was "
+                    f"dropped: {key!r}.",
+                    session_io.SessionDataWarning,
+                )
+                self.session.remove_pending(key)
+                self.session.save()
+                continue
+            self._promoted.add(key)
+            return [records]  # type: ignore[list-item]
+        return []
+
+    def _pop_fresh_pair(self, session: session_io.LabelingSession) -> TrainingExample:
+        """Pop a candidate we have not already recorded in the session."""
+        if self.active_learner is None:
+            raise IndexError("No more unlabeled examples to label")
+
+        while True:
+            pair = self.active_learner.pop()
+            records = tuple(pair)
+            key = self._key_for_records(records)
+
+            if key in session.latest or session.find_pending(key) is not None:
+                continue
+
+            session.add_pending(key, self._ids_for_records(records), records)
+            session.save()
+            # Mark it as offered within this process so the next call draws a
+            # new pair instead of re-showing the one just handed out. It stays
+            # pending on disk until it is labeled.
+            self._promoted.add(key)
+            return pair
+
     def cleanup_training(self) -> None:  # pragma: no cover
         """
         Clean up data we used for training. Free up memory.
         """
         del self.training_pairs
         del self.active_learner
+        self.session = None
+        self._resolver = None
+        self._session_data = None
+        self._training_index = None
 
     def _read_training(self, training_file: TextIO) -> None:
         """
@@ -1165,7 +1435,8 @@ class ActiveMatching(Matching):
 
         logger.info("reading training from file")
         training_pairs = serializer.read_training(training_file)
-        self.mark_pairs(training_pairs)
+        self._mark_pairs_direct(training_pairs)
+        self._rebuild_training_index()
 
     def train(
         self, recall: float = 1.00, index_predicates: bool = True
@@ -1232,7 +1503,9 @@ class ActiveMatching(Matching):
         pickle.dump(self.classifier, file_obj)
         pickle.dump(self.predicates, file_obj)
 
-    def uncertain_pairs(self) -> TrainingExamples:
+    def uncertain_pairs(
+        self, session_file: SessionFile | None = None
+    ) -> TrainingExamples:
         """
          Returns a list of pairs of records from the sample of record pairs
          tuples that Dedupe is most curious to have labeled.
@@ -1240,17 +1513,79 @@ class ActiveMatching(Matching):
          This method is mainly useful for building a user interface for training
          a matching model.
 
+        Args:
+            session_file: Optional path or writable text file object used to
+                remember the labeling session. When supplied, the pairs that
+                are shown to the user are recorded before they are returned, so
+                an interrupted labeling session can be resumed with
+                :meth:`~resume_session` or by passing the same file to
+                :meth:`~mark_pairs`. Pairs that were already shown but not
+                answered are returned first.
+
         Examples:
             >>> pair = matcher.uncertain_pairs()
             >>> print(pair)
             [({'name' : 'Georgie Porgie'}, {'name' : 'Georgette Porgette'})]
+
+            >>> pair = matcher.uncertain_pairs(session_file='labeling.json')
         """
         assert (
             self.active_learner is not None
         ), "Please initialize with the prepare_training method"
-        return [self.active_learner.pop()]
 
-    def mark_pairs(self, labeled_pairs: TrainingData) -> None:
+        if session_file is None:
+            return [self.active_learner.pop()]
+
+        session = self._attach_session(session_file)
+        assert session is not None
+
+        pending = self._pending_examples()
+        if pending:
+            return pending
+
+        return [self._pop_fresh_pair(session)]
+
+    def resume_session(self, session_file: SessionFile) -> int:
+        """
+        Resume a previously saved labeling session.
+
+        Pairs that were already labeled are loaded into the training data, so
+        they are available to :meth:`~train`, and pairs that were shown but not
+        yet labeled become available again through :meth:`~uncertain_pairs`.
+
+        Args:
+            session_file: Path or writable text file object of a session
+                previously created by :meth:`~uncertain_pairs`.
+
+        Returns:
+            The number of labeled record pairs restored from the session.
+
+        Raises:
+            :class:`~dedupe.session.SessionMismatchError`: if the session was
+                created for a different kind of matcher or against different
+                input data.
+            :class:`~dedupe.session.SessionFileLoadingException`: if the file
+                is not a valid labeling session.
+
+        Examples:
+            >>> matcher.prepare_training(data)
+            >>> restored = matcher.resume_session('labeling.json')
+            >>> for pair in matcher.uncertain_pairs(session_file='labeling.json'):
+            >>>     ...
+        """
+        assert (
+            self.active_learner is not None
+        ), "Please initialize with the prepare_training method"
+
+        session = self._attach_session(session_file)
+        assert session is not None
+        return len(session.resolved())
+
+    def mark_pairs(
+        self,
+        labeled_pairs: TrainingData,
+        session_file: SessionFile | None = None,
+    ) -> None:
         """
         Add users labeled pairs of records to training data and update the
         matching model
@@ -1262,6 +1597,15 @@ class ActiveMatching(Matching):
             labeled_pairs: A dictionary with two keys, `match` and `distinct`
                            the values are lists that can contain pairs of
                            records
+
+            session_file: Optional path or writable text file object of a
+                          labeling session. When supplied, the labels are
+                          recorded in the session so that they survive an
+                          interruption and can be applied again on resume.
+                          Repeated submissions are idempotent; relabeling is
+                          recorded, and a contradictory label raises a
+                          :class:`~dedupe.session.SessionConflictWarning`
+                          instead of silently replacing the earlier label.
 
         Examples:
             >>> labeled_examples = {
@@ -1294,8 +1638,26 @@ class ActiveMatching(Matching):
         """
         self._checkTrainingPairs(labeled_pairs)
 
+        session = (
+            self._attach_session(session_file) if session_file is not None else None
+        )
+
+        if session is None:
+            self._mark_pairs_direct(labeled_pairs)
+        else:
+            self._mark_pairs_session(labeled_pairs, session)
+
+        if session is not None and session.dirty:
+            session.save()
+
+    def _mark_pairs_direct(self, labeled_pairs: TrainingData) -> None:
         self.training_pairs["match"].extend(labeled_pairs["match"])
         self.training_pairs["distinct"].extend(labeled_pairs["distinct"])
+
+        if self._training_index is not None:
+            # Keep conflict detection accurate if a session is attached but
+            # this call did not opt into it.
+            self._rebuild_training_index()
 
         if self.active_learner:
             examples, y = flatten_training(labeled_pairs)
@@ -1311,6 +1673,51 @@ class ActiveMatching(Matching):
                     "are in the data or training file "
                     "of the `prepare_training()` method"
                 )
+
+    def _mark_pairs_session(
+        self, labeled_pairs: TrainingData, session: session_io.LabelingSession
+    ) -> None:
+        # A pair submitted under both `match` and `distinct` in the same call
+        # means "unsure" (see `dedupe.convenience._mark_pair`). Treat it as a
+        # single event rather than a spurious conflict.
+        labels_by_key: dict[str, set[str]] = {}
+        records_by_key: dict[str, tuple] = {}
+        order: list[str] = []
+
+        for label in ("match", "distinct"):
+            for pair in labeled_pairs[label]:
+                records = tuple(pair)
+                key = self._key_for_records(records)
+                if key not in labels_by_key:
+                    labels_by_key[key] = set()
+                    records_by_key[key] = records
+                    order.append(key)
+                labels_by_key[key].add(label)
+
+        changed = False
+        for key in order:
+            records = records_by_key[key]
+            labels = labels_by_key[key]
+            label = "unsure" if len(labels) > 1 else next(iter(labels))
+
+            known_to_session = key in session.latest
+            outcome = session.record_label(
+                key, self._ids_for_records(records), label, records
+            )
+            if outcome == "duplicate":
+                continue
+
+            # record_label warns when it contradicts the session's own
+            # history. If the pair was only known from a training file, that
+            # contradiction is surfaced here instead, so nothing is replaced
+            # silently.
+            if self._upsert_training(
+                records, label, warn_conflict=not known_to_session
+            ):
+                changed = True
+
+        if changed and self.active_learner is not None:
+            self._refit_active_learner()
 
     def _checkTrainingPairs(self, labeled_pairs: TrainingData) -> None:
         try:
@@ -1397,6 +1804,8 @@ class Dedupe(ActiveMatching, DedupeMatching):
 
         # Reset active learner
         self.active_learner = None
+        self._reset_session()
+        self._set_session_input("dedupe", [data])
 
         if training_file:
             self._read_training(training_file)
@@ -1465,6 +1874,8 @@ class Link(ActiveMatching):
 
         # Reset active learner
         self.active_learner = None
+        self._reset_session()
+        self._set_session_input("link", [data_1, data_2])
 
         if training_file:
             self._read_training(training_file)
