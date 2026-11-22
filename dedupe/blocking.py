@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from dedupe.ids import maybe_encode_record_id
+
 if TYPE_CHECKING:
     from typing import (
         Any,
@@ -24,7 +26,6 @@ if TYPE_CHECKING:
 
     Docs = Union[Iterable[str], Iterable[Iterable[str]]]
     IndexList = DefaultDict[str, List[dedupe.predicates.IndexPredicate]]
-
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class Fingerprinter:
                     self.index_predicates.append(predicate)
 
     def __call__(
-        self, records: Iterable[Record], target: bool = False
+        self, records: Iterable[Record], target: bool = False, encode: bool = False
     ) -> Generator[tuple[str, RecordID]]:
         """
         Generate the predicates for records. Yields tuples of (predicate,
@@ -86,6 +87,15 @@ class Fingerprinter:
                     you will dramatically reduce the total number
                     of comparisons without a loss of accuracy.
 
+            encode: When `True`, emit each record id through
+                    :func:`dedupe.ids.encode_record_id`. The storage
+                    pipeline enables this for any collection whose ids are
+                    heterogeneous or composite, so that
+                    `(source, original_id)` ids survive storage and the
+                    integer `1` can never merge with the string `"1"`.
+                    Homogeneous single-table collections leave it `False`
+                    and keep receiving the original ids.
+
         .. code:: python
 
            > data = [(1, {'name' : 'bob'}), (2, {'name' : 'suzanne'})]
@@ -102,11 +112,19 @@ class Fingerprinter:
 
         for i, record in enumerate(records):
             record_id, instance = record
+            if encode:
+                # Heterogeneous or composite (source, original_id) ids
+                # cannot survive SQLite/numpy storage in raw form, so emit
+                # a stable encoded identity. The original id is restored
+                # when pairs are read back out.
+                emitted_id: RecordID = maybe_encode_record_id(record_id, True)
+            else:
+                emitted_id = record_id
 
             for pred_id, predicate in predicates:
                 block_keys = predicate(instance, target=target)
                 for block_key in block_keys:
-                    yield block_key + pred_id, record_id
+                    yield block_key + pred_id, emitted_id
 
             if i and i % 10000 == 0:
                 logger.info(

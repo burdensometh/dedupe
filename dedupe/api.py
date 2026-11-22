@@ -23,6 +23,7 @@ import dedupe.blocking as blocking
 import dedupe.clustering as clustering
 import dedupe.core as core
 import dedupe.datamodel as datamodel
+import dedupe.ids as ids
 import dedupe.labeler as labeler
 import dedupe.predicates
 import dedupe.serializer as serializer
@@ -248,7 +249,9 @@ class DedupeMatching(IntegralMatching):
 
         self.fingerprinter.index_all(data)
 
-        id_type = core.sqlite_id_type(data)
+        encode_ids = ids.needs_encoding(data.keys())
+        example_id = next(iter(data.keys()))
+        id_type = core.sqlite_id_type(example_id, encode_ids)
 
         # Blocking and pair generation are typically the first memory
         # bottlenecks, so we'll use sqlite3 to avoid doing them in memory
@@ -265,7 +268,7 @@ class DedupeMatching(IntegralMatching):
             )
             con.executemany(
                 "INSERT INTO blocking_map values (?, ?)",
-                self.fingerprinter(data.items()),
+                self.fingerprinter(data.items(), encode=encode_ids),
             )
 
             self.fingerprinter.reset_indices()
@@ -288,9 +291,13 @@ class DedupeMatching(IntegralMatching):
             )
 
             for a_record_id, b_record_id in pairs:
+                # Restore the caller's original ids (int, str, or
+                # (source, original_id) tuple) before looking up records.
+                a_id = ids.decode_id(a_record_id)
+                b_id = ids.decode_id(b_record_id)
                 yield (
-                    (a_record_id, data[a_record_id]),
-                    (b_record_id, data[b_record_id]),
+                    (a_id, data[a_id]),
+                    (b_id, data[b_id]),
                 )
 
             pairs.close()
@@ -359,7 +366,7 @@ class DedupeMatching(IntegralMatching):
 
         logger.debug("matching done, begin clustering")
 
-        yield from clustering.cluster(scores, threshold)
+        yield from _decode_clusters(clustering.cluster(scores, threshold))
 
 
 class RecordLinkMatching(IntegralMatching):
@@ -403,8 +410,10 @@ class RecordLinkMatching(IntegralMatching):
 
         self.fingerprinter.index_all(data_2)
 
-        id_type_a = core.sqlite_id_type(data_1)
-        id_type_b = core.sqlite_id_type(data_2)
+        encode_a = ids.needs_encoding(data_1.keys())
+        encode_b = ids.needs_encoding(data_2.keys())
+        id_type_a = core.sqlite_id_type(next(iter(data_1.keys())), encode_a)
+        id_type_b = core.sqlite_id_type(next(iter(data_2.keys())), encode_b)
 
         # Blocking and pair generation are typically the first memory
         # bottlenecks, so we'll use sqlite3 to avoid doing them in memory
@@ -426,12 +435,12 @@ class RecordLinkMatching(IntegralMatching):
 
             con.executemany(
                 "INSERT INTO blocking_map_a values (?, ?)",
-                self.fingerprinter(data_1.items()),
+                self.fingerprinter(data_1.items(), encode=encode_a),
             )
 
             con.executemany(
                 "INSERT INTO blocking_map_b values (?, ?)",
-                self.fingerprinter(data_2.items(), target=True),
+                self.fingerprinter(data_2.items(), target=True, encode=encode_b),
             )
 
             self.fingerprinter.reset_indices()
@@ -453,9 +462,19 @@ class RecordLinkMatching(IntegralMatching):
             )
 
             for a_record_id, b_record_id in pairs:
+                # Restore the caller's original ids. Composite ids keep
+                # their sources, so a bare id shared by data_1 and
+                # data_2 is compared as two distinct records.
+                a_id = ids.decode_id(a_record_id)
+                b_id = ids.decode_id(b_record_id)
+                # A record can never match itself. With composite
+                # identities this can happen when a table is linked
+                # against itself, so skip those edges explicitly.
+                if a_id == b_id:
+                    continue
                 yield (
-                    (a_record_id, data_1[a_record_id]),
-                    (b_record_id, data_2[b_record_id]),
+                    (a_id, data_1[a_id]),
+                    (b_id, data_2[b_id]),
                 )
 
             pairs.close()
@@ -548,7 +567,7 @@ class RecordLinkMatching(IntegralMatching):
         else:
             links = pair_scores[pair_scores["score"] > threshold]
 
-        links_evaluated: Links = list(links)  # type: ignore[assignment]
+        links_evaluated: Links = list(_decode_links(links))  # type: ignore[assignment]
         _cleanup_scores(pair_scores)
         return links_evaluated
 
@@ -605,7 +624,8 @@ class RecordLinkMatching(IntegralMatching):
 
         logger.debug("matching done, begin clustering")
 
-        yield from clustering.greedyMatching(scores)
+        for (a, b), score in clustering.greedyMatching(scores):
+            yield (ids.decode_pair((a, b))), score
 
     def many_to_one(self, scores: Scores, threshold: float = 0.0) -> ArrayLinks:
         """
@@ -657,7 +677,8 @@ class RecordLinkMatching(IntegralMatching):
 
         logger.debug("matching done, begin clustering")
 
-        yield from clustering.pair_gazette_matching(scores, threshold, 1)
+        for row in clustering.pair_gazette_matching(scores, threshold, 1):
+            yield (ids.decode_pair(row["pairs"]), row["score"])
 
 
 class GazetteerMatching(Matching):
@@ -677,6 +698,10 @@ class GazetteerMatching(Matching):
             MutableMapping[int, RecordDict] | MutableMapping[str, RecordDict]
         )
         self.indexed_data = {}  # type: ignore[assignment]
+
+        # Whether the persistent index stores encoded text ids. Fixed on
+        # the first index() call so every batch shares one storage scheme.
+        self._index_encodes_ids: bool | None = None
 
     def _close(self) -> None:
         if not self.in_memory:
@@ -706,7 +731,17 @@ class GazetteerMatching(Matching):
 
         self.fingerprinter.index_all(data)
 
-        id_type = core.sqlite_id_type(data)
+        encode_ids = ids.needs_encoding(data.keys())
+        if self._index_encodes_ids is None:
+            self._index_encodes_ids = encode_ids
+        elif self._index_encodes_ids != encode_ids:
+            raise ValueError(
+                "All data passed to index() must use the same kind of "
+                "record id: either plain ids from one table, or composite "
+                "(source, original_id) ids / a homogeneous type."
+            )
+
+        id_type = core.sqlite_id_type(next(iter(data.keys())), encode_ids)
 
         con = sqlite3.connect(self.db)
 
@@ -722,7 +757,7 @@ class GazetteerMatching(Matching):
 
         con.executemany(
             "REPLACE INTO indexed_records VALUES (?, ?)",
-            self.fingerprinter(data.items(), target=True),
+            self.fingerprinter(data.items(), target=True, encode=encode_ids),
         )
 
         con.execute(
@@ -763,10 +798,14 @@ class GazetteerMatching(Matching):
             )
 
         con = sqlite3.connect(self.db)
+        encode_ids = bool(self._index_encodes_ids)
         con.executemany(
             """DELETE FROM indexed_records
                            WHERE record_id = ?""",
-            ((k,) for k in data.keys()),
+            (
+                (ids.maybe_encode_record_id(k, encode_ids),)
+                for k in data.keys()
+            ),
         )
 
         con.commit()
@@ -826,7 +865,8 @@ class GazetteerMatching(Matching):
             ]
         """
 
-        id_type = core.sqlite_id_type(data)
+        encode_ids = ids.needs_encoding(data.keys())
+        id_type = core.sqlite_id_type(next(iter(data.keys())), encode_ids)
 
         con = sqlite3.connect(self.db, check_same_thread=False)
 
@@ -836,7 +876,8 @@ class GazetteerMatching(Matching):
             f"CREATE TEMPORARY TABLE blocking_map (block_key text, record_id {id_type})"
         )
         con.executemany(
-            "INSERT INTO blocking_map VALUES (?, ?)", self.fingerprinter(data.items())
+            "INSERT INTO blocking_map VALUES (?, ?)",
+            self.fingerprinter(data.items(), encode=encode_ids),
         )
 
         pairs = con.execute(
@@ -855,13 +896,18 @@ class GazetteerMatching(Matching):
         pair_blocks = itertools.groupby(pairs, lambda x: x[0])
 
         for _, pair_block in pair_blocks:
-            yield [
-                (
-                    (a_record_id, data[a_record_id]),
-                    (b_record_id, self.indexed_data[b_record_id]),
+            block = []
+            for a_record_id, b_record_id in pair_block:
+                # Restore the caller's original ids before record lookup.
+                a_id = ids.decode_id(a_record_id)
+                b_id = ids.decode_id(b_record_id)
+                block.append(
+                    (
+                        (a_id, data[a_id]),
+                        (b_id, self.indexed_data[b_id]),
+                    )
                 )
-                for a_record_id, b_record_id in pair_block
-            ]
+            yield block
 
         pairs.close()
         con.execute("ROLLBACK")
@@ -913,7 +959,9 @@ class GazetteerMatching(Matching):
             n_matches: How many top scoring pairs to select per group
         """
 
-        yield from clustering.gazetteMatching(score_blocks, threshold, n_matches)
+        yield from _decode_score_blocks(
+            clustering.gazetteMatching(score_blocks, threshold, n_matches)
+        )
 
     @overload
     def search(
@@ -1564,3 +1612,53 @@ def _cleanup_scores(arr: Scores) -> None:
         del arr
         if mmap_file:
             os.remove(mmap_file)
+
+
+def _decode_clusters(
+    clusters: Clusters,
+) -> Clusters:
+    """Restore original record ids inside hierarchical clusters."""
+    for record_ids, confidence in clusters:
+        yield tuple(ids.decode_id(record_id) for record_id in record_ids), confidence
+
+
+def _decode_links(links: Links) -> Links:
+    """Restore original record ids inside record-link results.
+
+    Handles both tuple links, ``(((a, b), score), ...)`` from
+    :meth:`RecordLinkMatching.one_to_one` and
+    :meth:`RecordLinkMatching.many_to_one`, and structured numpy arrays from
+    the unconstrained many-to-many path.
+    """
+    for link in links:
+        if isinstance(link, numpy.ndarray):
+            yield _decode_score_array(link)
+        else:
+            (a, b), score = link
+            yield (ids.decode_pair((a, b)), score)
+
+
+def _decode_score_array(scored: numpy.ndarray) -> numpy.ndarray:
+    """Return a copy of a structured score array with ids decoded.
+
+    Integer ids are returned unchanged, including their structured dtype.
+    Text id columns (string ids that were encoded, or composite ids) cannot
+    hold decoded tuples, so their rows are produced as an object array of
+    ``((a, b), score)`` pairs.
+    """
+    if scored.dtype["pairs"].base.kind == "i":
+        return scored
+
+    return numpy.array(
+        [
+            ((ids.decode_id(a), ids.decode_id(b)), float(score))
+            for (a, b), score in scored
+        ],
+        dtype=object,
+    )
+
+
+def _decode_score_blocks(score_blocks: ArrayLinks) -> ArrayLinks:
+    """Restore original record ids in each gazetteer score block."""
+    for block in score_blocks:
+        yield _decode_score_array(block)

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, overload
 import numpy
 
 from dedupe.backport import RLock
+from dedupe.ids import maybe_encode_record_id, pair_needs_encoding
 
 if TYPE_CHECKING:
     from typing import Any, Generator, Iterable, Iterator, Literal, Sequence, Union
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
         RecordPairs,
         Scores,
     )
-
     _Queue = Union[multiprocessing.dummy.Queue, multiprocessing.Queue]
 
 
@@ -48,6 +48,8 @@ class ScoreDupes:
         exception_queue: _Queue,
         score_file_path: str,
         dtype: numpy.dtype,
+        id_dtype: RecordIDDType,
+        encode_ids: bool,
         offset,
     ):
         self.featurizer = featurizer
@@ -56,6 +58,8 @@ class ScoreDupes:
         self.exception_queue = exception_queue
         self.score_file_path = score_file_path
         self.dtype = dtype
+        self.id_dtype = id_dtype
+        self.encode_ids = encode_ids
         self.offset = offset
 
     def __call__(self) -> None:
@@ -82,7 +86,23 @@ class ScoreDupes:
         if not mask.any():
             return
         scores = scores[mask]
-        record_id_array = numpy.array(record_ids)[mask]
+        if self.encode_ids:
+            # Heterogeneous or composite (source, original_id) ids cannot
+            # share a numpy column in their raw form, so they are rendered
+            # as stable, lossless text before entering the score array.
+            record_id_array = numpy.array(
+                [
+                    [
+                        maybe_encode_record_id(record_id, True)
+                        for record_id in pair
+                    ]
+                    for pair, keep in zip(record_ids, mask)
+                    if keep
+                ],
+                dtype=self.id_dtype,
+            )
+        else:
+            record_id_array = numpy.array(record_ids)[mask]
 
         with self.offset.get_lock():
             fp: Scores
@@ -128,8 +148,12 @@ def scoreDuplicates(
     # be necessary for python 3.7 on mac os.
     offset = multiprocessing.Value("Q", 0, lock=RLock())
 
-    id_type = sniff_id_type(first)
-    dtype = numpy.dtype([("pairs", id_type, 2), ("score", "f4")])
+    first_id_pair = (first[0][0], first[1][0])
+    id_dtype = sniff_id_type([first_id_pair])
+    # Composite ids, and any batch mixing integer with string ids, need to
+    # be rendered as text before entering the score array.
+    encode_ids = pair_needs_encoding([first_id_pair])
+    dtype = numpy.dtype([("pairs", id_dtype, 2), ("score", "f4")])
 
     n_map_processes = max(num_cores, 1)
     score_records = ScoreDupes(
@@ -139,6 +163,8 @@ def scoreDuplicates(
         exception_queue,
         score_file_path,
         dtype,
+        id_dtype,
+        encode_ids,
         offset,
     )
     map_processes = [Process(target=score_records) for _ in range(n_map_processes)]
@@ -198,14 +224,26 @@ class ScoreGazette:
         features = self.featurizer(records)
         scores = self.classifier.predict_proba(features)[:, -1]
 
-        id_type = sniff_id_type(record_ids)
-        ids = numpy.array(record_ids, dtype=id_type)
+        id_dtype = sniff_id_type(record_ids)
+        encode_ids = pair_needs_encoding(record_ids)
+        if encode_ids:
+            # Composite ids and mixed int/str batches are rendered as
+            # stable, lossless text before entering the score array.
+            ids = numpy.array(
+                [
+                    [maybe_encode_record_id(record_id, True) for record_id in pair]
+                    for pair in record_ids
+                ],
+                dtype=id_dtype,
+            )
+        else:
+            ids = numpy.array(record_ids, dtype=id_dtype)
 
         mask = scores > 0
         scores = scores[mask]
         ids = ids[mask]
 
-        dtype = numpy.dtype([("pairs", id_type, 2), ("score", "f4")])
+        dtype = numpy.dtype([("pairs", id_dtype, 2), ("score", "f4")])
         scored_pairs: Scores = numpy.empty(shape=len(scores), dtype=dtype)
         scored_pairs["pairs"] = ids
         scored_pairs["score"] = scores
@@ -299,34 +337,52 @@ def sniff_id_type(ids: Sequence[tuple[int, int]]) -> type[int]: ...
 
 
 @overload
-def sniff_id_type(ids: Sequence[tuple[str, str]]) -> tuple[type[str], Literal[256]]: ...
+def sniff_id_type(
+    ids: Sequence[tuple[object, object]]
+) -> tuple[type[str], Literal[256]]: ...
 
 
 def sniff_id_type(ids: Sequence[tuple[RecordID, RecordID]]) -> RecordIDDType:
-    example = ids[0][0]
-    python_type = type(example)
+    """Choose the numpy dtype for the record-id column.
+
+    ``ids`` is a sequence of ``(id_a, id_b)`` id pairs.
+    """
+    id_a, id_b = ids[0]
+    python_type = type(id_a)
     dtype: RecordIDDType
-    if python_type is str:
+    if python_type is int:
+        # A batch that mixes integers with strings, or carries composite
+        # ids, is encoded as text even when the first id is an integer.
+        if pair_needs_encoding([(id_a, id_b)]):
+            dtype = (str, 256)
+        else:
+            int(id_a)  # make sure we can cast to int
+            dtype = int
+    elif python_type in (str, tuple):
+        # Strings and composite (source, original_id) ids are encoded as
+        # text before they enter the score array.
         dtype = (str, 256)
-    elif python_type is int:
-        int(example)  # make sure we can cast to int
-        dtype = int
     else:
         raise ValueError("Invalid type for record id")
 
     return dtype
 
 
-def sqlite_id_type(data: Data) -> Literal["text", "integer"]:
-    example = next(iter(data.keys()))
-    python_type = type(example)
+def sqlite_id_type(
+    example_id: RecordID, encode_ids: bool
+) -> Literal["text", "integer"]:
+    """SQLite column type for the record id column.
 
-    if python_type is str:
+    When ids are encoded (a heterogeneous or composite-keyed collection),
+    every stored id is text, so the column must be ``text``. Otherwise the
+    collection is homogeneous: plain integer ids use an ``integer`` column
+    and plain string ids use ``text``.
+    """
+    if encode_ids or isinstance(example_id, (str, tuple)):
         return "text"
-    elif python_type is int:
-        return "integer"
-    else:
+    if isinstance(example_id, bool) or not isinstance(example_id, int):
         raise ValueError("Invalid type for record id")
+    return "integer"
 
 
 def unique(seq: Iterable[Any]) -> list[Any]:

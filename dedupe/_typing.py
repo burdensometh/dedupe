@@ -28,21 +28,30 @@ if TYPE_CHECKING:
 
 
 RecordDict = Mapping[str, Any]
-RecordID = Union[int, str]
+RecordID = Union[int, str, Tuple[Union[int, str], Union[int, str]]]
 RecordIDDType = Union[Type[int], Tuple[Type[str], Literal[256]]]
-RecordIDPair = Union[Tuple[int, int], Tuple[str, str]]
+RecordIDPair = Union[
+    Tuple[int, int],
+    Tuple[str, str],
+    Tuple[RecordID, RecordID],
+]
 RecordInt = Tuple[int, RecordDict]
 RecordStr = Tuple[str, RecordDict]
-Record = Union[RecordInt, RecordStr]
+RecordComposite = Tuple[Tuple[Union[int, str], Union[int, str]], RecordDict]
+Record = Union[RecordInt, RecordStr, RecordComposite]
 RecordPairInt = Tuple[RecordInt, RecordInt]
 RecordPairStr = Tuple[RecordStr, RecordStr]
-RecordPairs = Union[Iterator[RecordPairInt], Iterator[RecordPairStr]]
+RecordPairs = Union[
+    Iterator[RecordPairInt],
+    Iterator[RecordPairStr],
+    Iterator[Tuple[Record, Record]],
+]
 BlockInt = List[RecordPairInt]
 BlockStr = List[RecordPairStr]
 Block = Union[RecordPairInt, RecordPairStr]
 BlocksInt = Iterator[BlockInt]
 BlocksStr = Iterator[BlockStr]
-Blocks = Union[BlocksInt, BlocksStr]
+Blocks = Union[BlocksInt, BlocksStr, Iterator[List[Tuple[Record, Record]]]]
 ClusterInt = Tuple[
     Tuple[int, ...], Union[numpy.typing.NDArray[numpy.float64], Tuple[float, ...]]
 ]
@@ -55,7 +64,8 @@ Clusters = Union[ClustersInt, ClustersStr]
 
 DataInt = Mapping[int, RecordDict]
 DataStr = Mapping[str, RecordDict]
-Data = Union[DataInt, DataStr]
+DataComposite = Mapping[Tuple[Union[int, str], Union[int, str]], RecordDict]
+Data = Union[DataInt, DataStr, DataComposite]
 
 RecordDictPair = Tuple[RecordDict, RecordDict]
 RecordDictPairs = List[RecordDictPair]
