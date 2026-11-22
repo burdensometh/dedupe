@@ -59,6 +59,17 @@ Data = Union[DataInt, DataStr]
 
 RecordDictPair = Tuple[RecordDict, RecordDict]
 RecordDictPairs = List[RecordDictPair]
+
+# A stable identifier for a candidate pair: the ids of its two records.
+CandidateID = Tuple[RecordID, RecordID]
+# Per-source, per-difficulty-bin annotation quotas. Keys are
+# (source, difficulty_bin) tuples and values are the maximum number of
+# real to-be-labeled pairs that may be drawn from that bucket.
+CandidateQuota = Mapping[Tuple[Any, int], int]
+# Per-source quotas that apply to every difficulty bin.
+SourceQuota = Mapping[Any, int]
+# A callable deriving the source of a record.
+SourceFunction = Callable[[RecordDict], Any]
 ArrayLinks = Iterable[numpy.ndarray]
 TupleLinksInt = Iterable[Tuple[Tuple[int, int], float]]
 TupleLinksStr = Iterable[Tuple[Tuple[str, str], float]]

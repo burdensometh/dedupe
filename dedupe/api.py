@@ -28,7 +28,7 @@ import dedupe.predicates
 import dedupe.serializer as serializer
 
 if TYPE_CHECKING:
-    from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, TextIO
+    from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, Sequence, TextIO
 
     import numpy.typing
 
@@ -1232,7 +1232,16 @@ class ActiveMatching(Matching):
         pickle.dump(self.classifier, file_obj)
         pickle.dump(self.predicates, file_obj)
 
-    def uncertain_pairs(self) -> TrainingExamples:
+    def uncertain_pairs(
+        self,
+        quotas: labeler.CandidateQuota | labeler.SourceQuota | None = None,
+        *,
+        source_field: str | labeler.SourceFunction | None = None,
+        bin_edges: Sequence[float] = (1.0 / 3.0, 2.0 / 3.0),
+        fallback: labeler.QuotaFallback = "global",
+        n: int | None = None,
+        seed: int | None = None,
+    ) -> TrainingExamples:
         """
          Returns a list of pairs of records from the sample of record pairs
          tuples that Dedupe is most curious to have labeled.
@@ -1240,15 +1249,63 @@ class ActiveMatching(Matching):
          This method is mainly useful for building a user interface for training
          a matching model.
 
+         When ``quotas`` is not given, a single most-uncertain pair is
+         returned, as in earlier versions of dedupe.
+
+         When ``quotas`` is given, a batch of candidates is selected under
+         per-source, per-difficulty-bin quotas. Candidates within each
+         ``(source, difficulty bin)`` bucket are drawn using the same
+         uncertainty scores that drive the unconstrained selection; each
+         selected pair consumes exactly one unit of quota even when several
+         blocking rules cover it. Quota that a bucket cannot fill is
+         redistributed according to ``fallback``. The same ``seed`` and the
+         same candidate set always reproduce the same batch, and the
+         returned pairs are removed from the candidate pool, so they can be
+         labeled and handed straight back to
+         :meth:`~dedupe.api.ActiveMatching.mark_pairs`.
+
+         Args:
+             quotas: Either a mapping of ``(source, difficulty_bin)`` to the
+                 maximum number of pairs to label from that bucket, or a
+                 mapping of source to a quota applying to every difficulty
+                 bin of that source.
+             source_field: Name of the record field holding the source, or a
+                 callable mapping a record to its source. Defaults to the
+                 ``"source"`` field.
+             bin_edges: Monotonic uncertainty cut points defining the
+                 difficulty bins; bins are numbered from zero, easiest first.
+             fallback: ``"global"`` (default) backfills unmet quota from any
+                 remaining candidate, ``"source"`` only from other bins of
+                 the declared sources, and ``"none"`` leaves quota unmet.
+             n: Overall cap on the number of returned pairs.
+             seed: Seed making the batch reproducible.
+
         Examples:
             >>> pair = matcher.uncertain_pairs()
             >>> print(pair)
             [({'name' : 'Georgie Porgie'}, {'name' : 'Georgette Porgette'})]
+
+            >>> batch = matcher.uncertain_pairs(
+            ...     {("web", 0): 5, ("web", 1): 5, ("call_center", 2): 5},
+            ...     seed=42,
+            ... )
+            >>> matcher.mark_pairs({"match": [], "distinct": batch})
         """
         assert (
             self.active_learner is not None
         ), "Please initialize with the prepare_training method"
-        return [self.active_learner.pop()]
+
+        if quotas is None:
+            return [self.active_learner.pop()]
+
+        return self.active_learner.pop_quota(
+            quotas,
+            source_field=source_field,
+            bin_edges=bin_edges,
+            fallback=fallback,
+            n=n,
+            seed=seed,
+        )
 
     def mark_pairs(self, labeled_pairs: TrainingData) -> None:
         """
