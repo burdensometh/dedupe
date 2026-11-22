@@ -1,3 +1,11 @@
+# Unreleased
+- Added `RecordLink.capacitated_matching` and `dedupe.clustering.capacitatedMatching`,
+  a maximum-total-score capacitated bipartite matching. Unlike the greedy
+  `one_to_one` matching, it optimizes over every candidate edge at once, honors a
+  per-target capacity given by business configuration, only uses edges above the
+  threshold, leaves records unlinked when beneficial, and breaks equal-score ties
+  deterministically.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

@@ -28,7 +28,15 @@ import dedupe.predicates
 import dedupe.serializer as serializer
 
 if TYPE_CHECKING:
-    from typing import BinaryIO, Collection, Generator, Iterable, MutableMapping, TextIO
+    from typing import (
+        BinaryIO,
+        Collection,
+        Generator,
+        Iterable,
+        Mapping,
+        MutableMapping,
+        TextIO,
+    )
 
     import numpy.typing
 
@@ -658,6 +666,80 @@ class RecordLinkMatching(IntegralMatching):
         logger.debug("matching done, begin clustering")
 
         yield from clustering.pair_gazette_matching(scores, threshold, 1)
+
+    def capacitated_matching(
+        self,
+        scores: Scores,
+        capacity: Mapping[RecordID, int] | int = 1,
+        threshold: float = 0.0,
+    ) -> TupleLinks:
+        """From the similarity scores of pairs of records, decide which
+        pairs refer to the same entity.
+
+        Every record in data_1 can match at most one record from
+        data_2. How many records from data_1 can match to the same
+        record in data_2 is controlled by the capacity of that record,
+        which is given by business configuration rather than being fixed
+        at one.
+
+        Unlike :func:`one_to_one`, which greedily commits to edges one
+        at a time in descending score order, this method considers all
+        the candidate edges together and returns the matching with the
+        maximum total similarity score while respecting every capacity.
+        A globally better match can therefore replace a locally tempting
+        one, and a record is simply left unlinked when no eligible edge
+        remains for it.
+
+        Only edges whose predicted probability is above the threshold
+        are eligible. If several matchings share the same maximum total
+        score, the choice is deterministic and stable: record ids are
+        ranked in ascending order and the matching that minimizes the sum
+        of the linked source ranks, and then the sum of the linked target
+        ranks, is selected.
+
+        Yields pairs of record ids with a confidence score as a float
+        between 0 and 1. The record_ids within the pair should refer to the
+        same entity and the confidence score is the estimated probability
+        that the records refer to the same entity.
+
+        Args:
+            scores: a numpy `structured array <https://docs.scipy.org/doc/numpy/user/basics.rec.html>`_ with a dtype of `[('pairs', id_type, 2),
+                    ('score', 'f4')]` where dtype is either a str
+                    or int, and score is a number between 0 and
+                    1. The 'pairs' column contains pairs of ids of
+                    the records compared and the score column
+                    should contains the similarity score for that
+                    pair of records.
+
+            capacity: The maximum number of records from data_1 that
+                      can match to a single record from data_2. Either a
+                      positive integer applied to every target record, or
+                      a mapping from target record ids to positive
+                      integer capacities. Target ids missing from the
+                      mapping default to a capacity of one.
+
+            threshold: Number between 0 and 1. We
+                       will consider records as potential
+                       duplicates if the predicted probability of
+                       being a duplicate is above the threshold.
+
+                       Lowering the number will increase recall, raising it
+                       will increase precision
+
+        Examples:
+            >>> pairs = matcher.pairs(data_1, data_2)
+            >>> scores = matcher.scores(pairs, threshold=0.5)
+            >>> links = matcher.capacitated_matching(scores, {2: 2, 5: 1})
+            >>> list(links)
+            [
+                ((1, 2), 0.790),
+                ((4, 2), 0.720),
+                ((10, 11), 0.899)
+            ]
+        """
+        logger.debug("matching done, begin clustering")
+
+        yield from clustering.capacitatedMatching(scores, capacity, threshold)
 
 
 class GazetteerMatching(Matching):

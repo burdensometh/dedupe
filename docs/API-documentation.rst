@@ -182,6 +182,7 @@ RecordLink and StaticRecordLink
     .. automethod:: score
     .. automethod:: one_to_one
     .. automethod:: many_to_one
+    .. automethod:: capacitated_matching
 
 .. class:: StaticRecordLink
    :noindex:
@@ -205,6 +206,10 @@ RecordLink and StaticRecordLink
    .. method:: many_to_one(scores, threshold=0.0)
 
 	Same as :func:`dedupe.RecordLink.many_to_one`
+
+   .. method:: capacitated_matching(scores, capacity=1, threshold=0.0)
+
+        Same as :func:`dedupe.RecordLink.capacitated_matching`
 
 
 Gazetteer and StaticGazetteer
