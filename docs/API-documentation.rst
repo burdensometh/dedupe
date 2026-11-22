@@ -261,3 +261,58 @@ Convenience Functions
 .. autofunction:: dedupe.canonicalize
 .. autofunction:: dedupe.read_training
 .. autofunction:: dedupe.write_training
+
+
+Cross-Run Entity Identity
+-------------------------
+
+Re-clustering (for example, a monthly re-run of :func:`dedupe.Dedupe.partition`)
+does not keep clusters in a stable order, so the position of a cluster in
+the output is not a durable entity id. :class:`dedupe.EntityRegistry`
+publishes entity ids that are stable across rounds by tracking record
+membership. It decides whether each cluster retains an existing identity,
+is the result of a merge or a split, or is entirely new, and it keeps a
+mapping from record ids to their current entity id.
+
+.. code:: python
+
+    registry = dedupe.EntityRegistry()
+
+    # feed the output of partition directly, plain member tuples also work
+    result = registry.publish(matcher.partition(data), round=1)
+
+    # next month: ids are retained, merged, split or freshly minted
+    result = registry.publish(matcher.partition(new_data), round=2)
+
+    # an id merged away still resolves to the entity that absorbed it
+    current_id = registry.resolve(old_entity_id)
+
+    # split events name the members that changed identity
+    for event in result.events:
+        if event.kind == "split":
+            print(event.entity_id, event.changed_members, event.children)
+
+.. autoclass:: dedupe.EntityRegistry
+
+    .. automethod:: publish
+    .. automethod:: resolve
+    .. automethod:: members_for
+    .. autoattribute:: round
+    .. autoattribute:: entities
+    .. autoattribute:: members
+    .. autoattribute:: aliases
+    .. autoattribute:: history
+    .. automethod:: save
+    .. automethod:: load
+    .. automethod:: to_dict
+    .. automethod:: from_dict
+
+.. autoclass:: dedupe.PublishResult
+
+    .. automethod:: as_clusters
+
+.. autoclass:: dedupe.EntityEvent
+
+.. autofunction:: dedupe.mint_entity_id
+.. autofunction:: dedupe.reconcile_clusters
+
