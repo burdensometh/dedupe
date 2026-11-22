@@ -67,6 +67,15 @@ jobs:
         python benchmarks/benchmarks/canonical_matching.py
         python benchmarks/benchmarks/canonical_gazetteer.py
         python benchmarks/benchmarks/canonical_gazetteer.py
+        python -m benchmarks.entity_validation --folds 5 --seed 7 --modes dedupe link
+    - name: Entity validation replay
+      # Build a split, save it, then replay it against a retrained model.  The
+      # replayed coverage must match the original, which is what "validation
+      # inputs stay reproducible" means for the deployment model.
+      run: |
+        python -m benchmarks.entity_validation --folds 5 --seed 7 --modes dedupe --save-plan ./entity_split --output ./entity_cv.json
+        python -m benchmarks.entity_validation --load-plan ./entity_split.dedupe.json --seed 7 --output ./entity_replay.json
+        python -m benchmarks.check_replay entity_cv.json entity_replay.json
   settings_file_persists:
     runs-on: ubuntu-latest
     steps:

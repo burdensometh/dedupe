@@ -13,6 +13,22 @@ from dedupe.convenience import (  # noqa: F401
     training_data_link,
 )
 from dedupe.serializer import read_training, write_training  # noqa: F401
+from dedupe.validation import (  # noqa: F401
+    CrossValidationReport,
+    EntityLeakageError,
+    EntityPlan,
+    FoldAudit,
+    LinkPlan,
+    LinkQuality,
+    audit_record_folds,
+    entity_ids,
+    evaluate_dedupe,
+    evaluate_link,
+    refit_full_link,
+    refit_full_model,
+    replay_dedupe,
+    replay_link,
+)
 
 __all__ = [
     "Dedupe",
@@ -27,4 +43,18 @@ __all__ = [
     "training_data_link",
     "read_training",
     "write_training",
+    "CrossValidationReport",
+    "EntityLeakageError",
+    "EntityPlan",
+    "FoldAudit",
+    "LinkPlan",
+    "LinkQuality",
+    "audit_record_folds",
+    "entity_ids",
+    "evaluate_dedupe",
+    "evaluate_link",
+    "refit_full_link",
+    "refit_full_model",
+    "replay_dedupe",
+    "replay_link",
 ]

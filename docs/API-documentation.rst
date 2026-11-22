@@ -261,3 +261,37 @@ Convenience Functions
 .. autofunction:: dedupe.canonicalize
 .. autofunction:: dedupe.read_training
 .. autofunction:: dedupe.write_training
+
+
+Entity-Level Validation
+-----------------------
+
+Training and validation pairs drawn from the same records share entities,
+which overstates generalisation even when no single pair is repeated.  The
+:mod:`dedupe.validation` module resolves entity identities first, assigns
+whole entities to folds, and generates fold-specific training material and
+held-out match quality.
+
+.. autoclass:: dedupe.validation.EntityPlan
+   :members: from_data, from_entity_map, from_record_folds, coverage,
+             training_pairs, fold_data, save, load
+
+.. autoclass:: dedupe.validation.LinkPlan
+   :members: from_data, coverage, training_pairs, truth_pairs, save, load
+
+.. autoclass:: dedupe.validation.LinkQuality
+   :members: from_pairs
+
+.. autoclass:: dedupe.validation.CrossValidationReport
+   :members: from_quality, to_dict, save
+
+.. autofunction:: dedupe.validation.entity_ids
+.. autofunction:: dedupe.validation.positive_pairs
+.. autofunction:: dedupe.validation.audit_record_folds
+.. autofunction:: dedupe.validation.straddling_pairs
+.. autofunction:: dedupe.validation.run_dedupe_cv
+.. autofunction:: dedupe.validation.run_link_cv
+.. autofunction:: dedupe.validation.evaluate_dedupe
+.. autofunction:: dedupe.validation.evaluate_link
+.. autofunction:: dedupe.validation.refit_full_model
+.. autofunction:: dedupe.validation.refit_full_link

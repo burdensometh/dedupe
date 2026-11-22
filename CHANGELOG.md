@@ -1,3 +1,12 @@
+# Unreleased
+- Added `dedupe.validation`: entity-level (identity-based) train/validation
+  splitting. Resolves entity membership first, assigns whole entities to
+  folds, generates per-fold real training pairs and distances, and reports
+  split coverage plus held-out link quality. Cross-fold positives are never
+  silently relabelled as negatives; leaking record-level folds raise
+  `EntityLeakageError`. Splits are seeded and persistable for reproducible
+  validation, and a full-entity retrain is provided for deployment.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 
