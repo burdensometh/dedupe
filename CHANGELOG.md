@@ -1,3 +1,18 @@
+# 3.0.3
+- `canonicalize` / `getCanonicalRep` now accept explicit per-field
+  `FieldRule` objects. Canonical field values can be selected by
+  authoritative source (`"authority"`), most recent effective date
+  (`"latest"`), or the existing affine-gap centroid (`"centroid"`),
+  instead of always taking the smallest string-distance value.
+- Canonicalization now records provenance: the returned
+  `CanonicalRecord` (still a plain record dict, directly usable as a
+  Gazetteer index record) carries a `provenance` attribute naming the
+  member each field value came from.
+- Canonicalization is deterministic and order-independent. Empty
+  member values are always skipped in favor of real values; fields
+  that are empty on every member and fields a rule cannot resolve are
+  filled with configurable `missing_marker` / `conflict_marker`.
+
 # 3.0.2
 - Fixed regression in Exists predicate
 

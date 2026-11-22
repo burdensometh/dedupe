@@ -261,3 +261,12 @@ Convenience Functions
 .. autofunction:: dedupe.canonicalize
 .. autofunction:: dedupe.read_training
 .. autofunction:: dedupe.write_training
+
+Canonicalization
+----------------
+
+.. autoclass:: dedupe.FieldRule
+   :members:
+
+.. autoclass:: dedupe.canonical.CanonicalRecord
+   :members:

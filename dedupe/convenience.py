@@ -6,7 +6,7 @@ import itertools
 import random
 import sys
 import warnings
-from typing import Iterator, Literal, Tuple, overload
+from typing import Iterator, Literal, Mapping, Sequence, Tuple, overload
 
 import numpy
 
@@ -19,7 +19,7 @@ from dedupe._typing import (
     RecordID,
     TrainingData,
 )
-from dedupe.canonical import getCanonicalRep
+from dedupe.canonical import CanonicalRecord, FieldRule, getCanonicalRep
 from dedupe.core import unique
 
 IndicesIterator = Iterator[Tuple[int, int]]
@@ -351,15 +351,57 @@ def training_data_dedupe(
     return training_pairs
 
 
-def canonicalize(record_cluster: list[RecordDict]) -> RecordDict:  # pragma: nocover
+def canonicalize(
+    record_cluster: list[RecordDict],
+    field_rules: (
+        Sequence[FieldRule | Mapping] | Mapping[str, FieldRule | Mapping] | None
+    ) = None,
+    id_field: str | None = None,
+    missing_marker: object = "",
+    conflict_marker: object | None = None,
+) -> CanonicalRecord:
     """
     Constructs a canonical representation of a duplicate cluster by
-    finding canonical values for each field
+    finding canonical values for each field.
+
+    By default, each field's canonical value is the affine-gap centroid
+    of the non-empty member values. Per-field :class:`FieldRule`
+    objects can instead select the value from the most authoritative
+    source (``strategy="authority"``), from the member with the most
+    recent effective date (``strategy="latest"``), or keep the centroid
+    behavior (``strategy="centroid"``). Empty member values are always
+    skipped in favor of real values.
 
     Args:
         record_cluster: A list of records within a duplicate cluster, where
                         the records are dictionaries with field
                         names as keys and field values as values
+        field_rules: an optional list (or field-name keyed mapping) of
+                     :class:`~dedupe.canonical.FieldRule` objects, or
+                     plain mappings of their constructor arguments.
+                     Fields without a rule keep the centroid behavior
+        id_field: name of the field holding each member's identifier;
+                  when given, provenance is reported using those
+                  identifiers instead of member positions
+        missing_marker: value used for fields that are empty on every
+                        member (defaults to the empty string)
+        conflict_marker: value used when a rule cannot resolve a field,
+                         e.g. an authority rule whose members carry no
+                         source. Defaults to ``missing_marker``
+
+    Returns:
+        A :class:`~dedupe.canonical.CanonicalRecord`, which is itself a
+        plain record dict and so can be indexed directly by a
+        :class:`dedupe.Gazetteer`. Its ``provenance`` attribute maps
+        each field name to the member the selected value came from, or
+        ``None`` for marker-filled fields. The output is deterministic:
+        reordering ``record_cluster`` does not change it.
 
     """
-    return getCanonicalRep(record_cluster)
+    return getCanonicalRep(
+        record_cluster,
+        field_rules=field_rules,
+        id_field=id_field,
+        missing_marker=missing_marker,
+        conflict_marker=conflict_marker,
+    )
