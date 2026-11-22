@@ -11,6 +11,7 @@ from typing import (
     Literal,
     Mapping,
     MutableSequence,
+    Optional,
     Protocol,
     Sequence,
     Tuple,
@@ -85,6 +86,32 @@ class TrainingData(TypedDict):
     distinct: MutableSequence[RecordDictPair]
 
 
+class TrainingWeights(TypedDict, total=False):
+    """Optional per-label weights for labeled training pairs.
+
+    Each list must align, element by element, with the pairs stored
+    under the same label in a :class:`TrainingData` dictionary. A
+    ``None`` entry means the default weight of 1.0 for that pair.
+    """
+
+    match: MutableSequence[Optional[float]]
+    distinct: MutableSequence[Optional[float]]
+
+
+class WeightedTrainingData(TrainingData, total=False):
+    """Training data with optional sample weights.
+
+    The ``weights`` key is optional. When it is absent, every pair
+    has the default weight of 1.0.
+    """
+
+    weights: TrainingWeights
+
+
+# Optional per-example weights, aligned with a sequence of training pairs
+WeightsLike = Optional[Iterable[float]]
+
+
 # Takes pairs of records and generates a (n_samples X n_features) array
 FeaturizerFunction = Callable[
     [Sequence[RecordDictPair]], numpy.typing.NDArray[numpy.float64]
@@ -99,6 +126,17 @@ class Classifier(Protocol):
     def predict_proba(
         self, X: numpy.typing.NDArray[numpy.float64]
     ) -> numpy.typing.NDArray[numpy.float64]: ...
+
+
+class WeightedClassifier(Classifier, Protocol):
+    """A classifier whose fit method can account for per-example weights."""
+
+    def fit(
+        self,
+        X: numpy.typing.NDArray[numpy.float64],
+        y: LabelsLike,
+        sample_weight: WeightsLike = None,
+    ) -> None: ...
 
 
 class ClosableJoinable(Protocol):

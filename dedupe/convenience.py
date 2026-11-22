@@ -18,6 +18,7 @@ from dedupe._typing import (
     RecordDictPair,
     RecordID,
     TrainingData,
+    WeightedTrainingData,
 )
 from dedupe.canonical import getCanonicalRep
 from dedupe.core import unique
@@ -108,7 +109,7 @@ LabeledPair = Tuple[RecordDictPair, Literal["match", "distinct", "unsure"]]
 
 def _mark_pair(deduper: dedupe.api.ActiveMatching, labeled_pair: LabeledPair) -> None:
     record_pair, label = labeled_pair
-    examples: TrainingData = {"distinct": [], "match": []}
+    examples: WeightedTrainingData = {"distinct": [], "match": []}
     if label == "unsure":
         # See https://github.com/dedupeio/dedupe/issues/984 for reasoning
         examples["match"].append(record_pair)

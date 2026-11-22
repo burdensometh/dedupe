@@ -25,7 +25,7 @@ if TYPE_CHECKING:
         DataStr,
     )
     from ._typing import RecordDictPairs as TrainingExamples
-    from ._typing import RecordID, RecordIDPair
+    from ._typing import RecordID, RecordIDPair, WeightsLike
     from .predicates import Predicate
 
 
@@ -39,14 +39,41 @@ class BlockLearner(ABC):
         recall: float,
         index_predicates: bool,
         candidate_types: Literal["simple", "random forest"] = "simple",
+        weights: WeightsLike = None,
     ) -> tuple[Predicate, ...]:
         """
         Takes in a set of training pairs and predicates and tries to find
         a good set of blocking rules.
+
+        Args:
+            matches: Pairs of records that are known to refer to the
+                     same entity.
+            recall: The proportion of the true match pairs that the
+                    learned blocking rules must cover. When ``weights``
+                    are given, this is a proportion of the total weight
+                    of the pairs.
+            index_predicates: Should we consider predicates that rely
+                              upon indexing the data.
+            candidate_types: The types of candidate blocking rules to
+                             consider.
+            weights: Optional per-pair weights, aligned with
+                     ``matches``. Coverage is measured as the sum of
+                     the weights of covered pairs, so pairs with a
+                     weight of zero do not contribute. When ``None``,
+                     every pair counts equally.
         """
         assert (
             matches
         ), "You must supply at least one pair of matching records to learn blocking rules."
+
+        match_weights: list[float] | None = None
+        if weights is not None:
+            match_weights = [float(weight) for weight in weights]
+            if len(match_weights) != len(matches):
+                raise ValueError(
+                    "weights and matches must be same length. "
+                    f"Got {len(match_weights)} and {len(matches)}"
+                )
 
         comparison_cover = self.comparison_cover
         match_cover = self.cover(matches, index_predicates=index_predicates)
@@ -59,11 +86,18 @@ class BlockLearner(ABC):
             pair for i, pair in enumerate(matches) if i not in coverable_dupes
         ]
 
-        target_cover = int(recall * len(matches))
+        coverable: float
+        target_cover: float
+        if match_weights is None:
+            target_cover = int(recall * len(matches))
+            coverable = len(coverable_dupes)
+        else:
+            target_cover = recall * sum(match_weights)
+            coverable = sum(match_weights[i] for i in coverable_dupes)
 
-        if len(coverable_dupes) < target_cover:
+        if coverable < target_cover:
             logger.debug(uncoverable_dupes)
-            target_cover = len(coverable_dupes)
+            target_cover = coverable
 
         candidate_cover = simple_candidates(match_cover, comparison_cover)
 
@@ -84,7 +118,9 @@ class BlockLearner(ABC):
         else:
             raise ValueError("candidate_type is not valid")
 
-        final_predicates = branch_and_bound.search(candidate_cover, target_cover, 2500)
+        final_predicates = branch_and_bound.search(
+            candidate_cover, target_cover, 2500, weights=match_weights
+        )
 
         logger.info("Final predicate set:")
         for predicate in final_predicates:

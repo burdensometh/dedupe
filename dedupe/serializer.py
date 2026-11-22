@@ -1,7 +1,7 @@
 import json
 from typing import Any, Iterator, TextIO
 
-from dedupe._typing import TrainingData
+from dedupe._typing import WeightedTrainingData
 
 
 def _from_json(json_object: Any) -> Any:
@@ -45,19 +45,29 @@ def read_training(training_file: TextIO) -> Any:
         training_file: file object containing the training data
 
     Returns:
-        A dictionary with two keys, `match` and `distinct`. See the inverse,
-        :func:`write_training`.
+        A dictionary with two keys, `match` and `distinct`, and an
+        optional `weights` key if the training data was written with
+        weights. See the inverse, :func:`write_training`.
     """
     return json.load(training_file, object_hook=_from_json)
 
 
-def write_training(labeled_pairs: TrainingData, file_obj: TextIO) -> None:
+def write_training(labeled_pairs: WeightedTrainingData, file_obj: TextIO) -> None:
     """
     Write a JSON file that contains labeled examples
 
     Args:
         labeled_pairs: A dictionary with two keys, `match` and `distinct`.
                        The values are lists that can contain pairs of records
+
+                       The dictionary can also have an optional `weights`
+                       key, with a dictionary of the same form, but with
+                       lists of numbers instead of lists of pairs. Each
+                       number is the weight of the pair in the same
+                       position under the same label. The weights are
+                       written out together with their pairs, so reading
+                       the file back preserves the association between
+                       each pair and its weight.
         file_obj: file object to write training data to
 
     .. code:: python
@@ -69,6 +79,9 @@ def write_training(labeled_pairs: TrainingData, file_obj: TextIO) -> None:
             "distinct": [
                 ({'name' : 'Georgie Porgie'}, {'name' : 'Georgette Porgette'}),
             ],
+            "weights": {
+                "match": [0.5],
+            },
         }
         with open('training.json', 'w') as f:
             dedupe.write_training(examples, f)

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     )
     from dedupe._typing import RecordDictPair as TrainingExample
     from dedupe._typing import RecordDictPairs as TrainingExamples
-    from dedupe._typing import RecordIDPair
+    from dedupe._typing import RecordIDPair, WeightsLike
     from dedupe.predicates import Predicate
 
 
@@ -52,7 +52,9 @@ class Learner(ABC, HasCandidates):
     _fitted: bool = False
 
     @abstractmethod
-    def fit(self, pairs: TrainingExamples, y: LabelsLike) -> None:
+    def fit(
+        self, pairs: TrainingExamples, y: LabelsLike, weights: WeightsLike = None
+    ) -> None:
         """Train on the given data."""
 
     @abstractmethod
@@ -64,7 +66,9 @@ class Learner(ABC, HasCandidates):
         """Remove a pair from self.candidates."""
 
     @staticmethod
-    def _verify_fit_args(pairs: TrainingExamples, y: LabelsLike) -> list[Literal[0, 1]]:
+    def _verify_fit_args(
+        pairs: TrainingExamples, y: LabelsLike, weights: WeightsLike = None
+    ) -> tuple[list[Literal[0, 1]], list[float] | None]:
         """Helper method to verify the arguments given to fit()"""
         if len(pairs) == 0:
             raise ValueError("pairs must have length of at least 1")
@@ -73,7 +77,15 @@ class Learner(ABC, HasCandidates):
             raise ValueError(
                 f"pairs and y must be same length. Got {len(pairs)} and {len(y)}"
             )
-        return y
+        checked_weights = None
+        if weights is not None:
+            checked_weights = [float(weight) for weight in weights]
+            if len(pairs) != len(checked_weights):
+                raise ValueError(
+                    "pairs and weights must be same length. "
+                    f"Got {len(pairs)} and {len(checked_weights)}"
+                )
+        return y, checked_weights
 
 
 class MatchLearner(Learner):
@@ -83,9 +95,18 @@ class MatchLearner(Learner):
         self._classifier = sklearn.linear_model.LogisticRegression()
         self._features = self._featurizer(self.candidates)
 
-    def fit(self, pairs: TrainingExamples, y: LabelsLike) -> None:
-        y = self._verify_fit_args(pairs, y)
-        self._classifier.fit(self._featurizer(pairs), numpy.array(y))
+    def fit(
+        self, pairs: TrainingExamples, y: LabelsLike, weights: WeightsLike = None
+    ) -> None:
+        y, weights = self._verify_fit_args(pairs, y, weights)
+        if weights is None:
+            self._classifier.fit(self._featurizer(pairs), numpy.array(y))
+        else:
+            self._classifier.fit(
+                self._featurizer(pairs),
+                numpy.array(y),
+                sample_weight=numpy.array(weights),
+            )
         self._fitted = True
 
     def remove(self, index: int) -> None:
@@ -106,16 +127,34 @@ class BlockLearner(Learner):
         self._cached_scores: numpy.typing.NDArray[numpy.float64] | None = None
         self._old_dupes: TrainingExamples = []
 
-    def fit(self, pairs: TrainingExamples, y: LabelsLike) -> None:
-        y = self._verify_fit_args(pairs, y)
+    def fit(
+        self, pairs: TrainingExamples, y: LabelsLike, weights: WeightsLike = None
+    ) -> None:
+        y, weights = self._verify_fit_args(pairs, y, weights)
         dupes = [pair for label, pair in zip(y, pairs) if label]
 
-        new_dupes = [pair for pair in dupes if pair not in self._old_dupes]
+        dupe_weights: list[float] | None = None
+        if weights is None:
+            new_dupes = [pair for pair in dupes if pair not in self._old_dupes]
+        else:
+            dupe_weights = [weight for label, weight in zip(y, weights) if label]
+            # pairs with a weight of zero do not contribute, so they
+            # should not trigger learning new blocking rules
+            new_dupes = [
+                pair
+                for pair, weight in zip(dupes, dupe_weights)
+                if weight > 0 and pair not in self._old_dupes
+            ]
+
         new_uncovered = not all(self._predict(new_dupes))
 
         if new_uncovered:
             self.current_predicates = self.block_learner.learn(
-                dupes, recall=1.0, index_predicates=True, candidate_types="simple"
+                dupes,
+                recall=1.0,
+                index_predicates=True,
+                candidate_types="simple",
+                weights=dupe_weights,
             )
             self._cached_scores = None
             self._old_dupes = dupes
@@ -131,13 +170,18 @@ class BlockLearner(Learner):
         return self._cached_scores
 
     def learn_predicates(
-        self, dupes: TrainingExamples, recall: float, index_predicates: bool
+        self,
+        dupes: TrainingExamples,
+        recall: float,
+        index_predicates: bool,
+        weights: WeightsLike = None,
     ) -> tuple[Predicate, ...]:
         return self.block_learner.learn(
             dupes,
             recall=recall,
             index_predicates=index_predicates,
             candidate_types="random forest",
+            weights=weights,
         )
 
     def _predict(self, pairs: TrainingExamples) -> Labels:
@@ -343,6 +387,7 @@ class DisagreementLearner(HasCandidates):
     def __init__(self) -> None:
         self.y: numpy.typing.NDArray[numpy.int_] = numpy.array([])
         self.pairs: TrainingExamples = []
+        self.weights: numpy.typing.NDArray[numpy.float64] | None = None
         self.rng = numpy.random.default_rng()
 
     def pop(self) -> TrainingExample:
@@ -406,18 +451,46 @@ class DisagreementLearner(HasCandidates):
         for learner in self._learners:
             learner.remove(index)
 
-    def mark(self, pairs: TrainingExamples, y: LabelsLike) -> None:
+    def mark(
+        self, pairs: TrainingExamples, y: LabelsLike, weights: WeightsLike = None
+    ) -> None:
         self.y = numpy.concatenate([self.y, y])
         self.pairs.extend(pairs)
+
+        if weights is not None or self.weights is not None:
+            if self.weights is None:
+                # backfill the default weight for pairs marked before
+                # any weighted examples were seen
+                self.weights = numpy.ones(len(self.pairs) - len(pairs))
+            if weights is None:
+                # pairs marked without weights get the default weight
+                new_weights = numpy.ones(len(pairs))
+            else:
+                new_weights = numpy.array([float(weight) for weight in weights])
+                if len(new_weights) != len(pairs):
+                    raise ValueError(
+                        "pairs and weights must be same length. "
+                        f"Got {len(pairs)} and {len(new_weights)}"
+                    )
+            self.weights = numpy.concatenate([self.weights, new_weights])
+
         for learner in self._learners:
-            learner.fit(self.pairs, self.y)
+            learner.fit(self.pairs, self.y, self.weights)
 
     def learn_predicates(
         self, recall: float, index_predicates: bool
     ) -> tuple[Predicate, ...]:
         dupes = [pair for label, pair in zip(self.y, self.pairs) if label]
+        dupe_weights = None
+        if self.weights is not None:
+            dupe_weights = [
+                weight for label, weight in zip(self.y, self.weights) if label
+            ]
         return self.blocker.learn_predicates(
-            dupes, recall=recall, index_predicates=index_predicates
+            dupes,
+            recall=recall,
+            index_predicates=index_predicates,
+            weights=dupe_weights,
         )
 
 

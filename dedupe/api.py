@@ -5,9 +5,11 @@ Dedupe class
 """
 from __future__ import annotations
 
+import inspect
 import itertools
 import logging
 import multiprocessing
+import numbers
 import os
 import pickle
 import sqlite3
@@ -58,9 +60,10 @@ if TYPE_CHECKING:
         RecordID,
         RecordPairs,
         Scores,
-        TrainingData,
         TupleLinks,
         Variable,
+        WeightedClassifier,
+        WeightedTrainingData,
     )
 
 logger = logging.getLogger(__name__)
@@ -1103,7 +1106,7 @@ class ActiveMatching(Matching):
     """
 
     active_learner: labeler.DisagreementLearner | None
-    training_pairs: TrainingData
+    training_pairs: WeightedTrainingData
 
     def __init__(
         self,
@@ -1174,12 +1177,23 @@ class ActiveMatching(Matching):
         Learn final pairwise classifier and fingerprinting rules. Requires that
         adequate training data has been already been provided.
 
+        If the labeled pairs were marked with weights (see
+        :meth:`~mark_pairs`), the weights are passed to the classifier's
+        ``fit`` method as ``sample_weight`` and the fingerprinting rules
+        are learned to cover a ``recall`` proportion of the total weight
+        of the true match pairs. Pairs with a weight of zero do not
+        contribute. The classifier must accept a ``sample_weight``
+        argument in its ``fit`` method (the default logistic regression
+        does); if it does not, a ``TypeError`` is raised.
+
         Args:
             recall: The proportion of true dupe pairs in our
                     training data that that the learned fingerprinting
                     rules must cover. If we lower the recall, there will
                     be pairs of true dupes that we will never
-                    directly compare.
+                    directly compare. If the training data includes
+                    weights, this is the proportion of the total
+                    weight of true dupe pairs that must be covered.
 
                     recall should be a float between 0.0 and 1.0.
 
@@ -1195,16 +1209,54 @@ class ActiveMatching(Matching):
             self.active_learner is not None
         ), "Please initialize with the prepare_training method"
 
-        examples, y = flatten_training(self.training_pairs)
-        self.classifier.fit(self.data_model.distances(examples), y)
+        examples, y, weights = flatten_training(self.training_pairs)
+        features = self.data_model.distances(examples)
+        if weights is None:
+            self.classifier.fit(features, y)
+        else:
+            self._weighted_fit(features, y, weights)
 
         self.predicates = self.active_learner.learn_predicates(recall, index_predicates)
         self._fingerprinter = blocking.Fingerprinter(self.predicates)
         self.fingerprinter.reset_indices()
 
+    def _weighted_fit(
+        self,
+        features: numpy.typing.NDArray[numpy.float64],
+        y: LabelsLike,
+        weights: numpy.typing.NDArray[numpy.float64],
+    ) -> None:
+        """
+        Fit the classifier with per-example weights, raising a clear
+        error when the classifier cannot accept them.
+        """
+        unsupported_message = (
+            f"The classifier {self.classifier.__class__.__name__} does not "
+            "support weighted training examples: its fit method does not "
+            "accept a 'sample_weight' argument. Either remove the weights "
+            "from your training data, or set the 'classifier' attribute to "
+            "a classifier whose fit method accepts 'sample_weight', such "
+            "as the default logistic regression."
+        )
+
+        if not _fit_supports_sample_weight(self.classifier):
+            raise TypeError(unsupported_message)
+
+        classifier = cast("WeightedClassifier", self.classifier)
+        try:
+            classifier.fit(features, y, sample_weight=weights)
+        except TypeError as error:
+            # e.g. a meta-classifier that accepted **fit params but whose
+            # underlying estimator does not support sample_weight
+            if "sample_weight" in str(error):
+                raise TypeError(unsupported_message) from error
+            raise
+
     def write_training(self, file_obj: TextIO) -> None:  # pragma: no cover
         """
-        Write a JSON file that contains labeled examples
+        Write a JSON file that contains labeled examples. If the labeled
+        pairs were marked with weights, the weights are written out
+        together with their pairs.
 
         Args:
             file_obj: file object to write training data to
@@ -1250,7 +1302,7 @@ class ActiveMatching(Matching):
         ), "Please initialize with the prepare_training method"
         return [self.active_learner.pop()]
 
-    def mark_pairs(self, labeled_pairs: TrainingData) -> None:
+    def mark_pairs(self, labeled_pairs: WeightedTrainingData) -> None:
         """
         Add users labeled pairs of records to training data and update the
         matching model
@@ -1263,6 +1315,17 @@ class ActiveMatching(Matching):
                            the values are lists that can contain pairs of
                            records
 
+                           The dictionary can also have an optional `weights`
+                           key, with a dictionary of the same form, but with
+                           lists of numbers instead of lists of pairs. Each
+                           number is the weight of the pair in the same
+                           position under the same label, and indicates how
+                           much that labeled pair should count when fitting
+                           the classifier and learning blocking rules. A
+                           weight of zero means the pair does not contribute.
+                           Missing weights, or weights of `None`, are treated
+                           as the default weight of 1.0.
+
         Examples:
             >>> labeled_examples = {
             >>>     "match": [],
@@ -1274,6 +1337,18 @@ class ActiveMatching(Matching):
             >>>     ],
             >>> }
             >>> matcher.mark_pairs(labeled_examples)
+
+            >>> weighted_examples = {
+            >>>     "match": [
+            >>>         (
+            >>>             {"name": "Georgie Porgie"},
+            >>>             {"name": "George Porgie"},
+            >>>         )
+            >>>     ],
+            >>>     "distinct": [],
+            >>>     "weights": {"match": [0.5]},
+            >>> }
+            >>> matcher.mark_pairs(weighted_examples)
 
         .. note::
            `mark_pairs()` is primarily designed to be used with
@@ -1294,14 +1369,37 @@ class ActiveMatching(Matching):
         """
         self._checkTrainingPairs(labeled_pairs)
 
+        new_weights = labeled_pairs.get("weights")
+
+        if new_weights is not None or "weights" in self.training_pairs:
+            # once any weighted examples have been marked, we keep a
+            # weight for every stored pair, backfilling the default
+            # weight of 1.0 for pairs marked without weights
+            stored_weights = self.training_pairs.setdefault(
+                "weights",
+                {
+                    "match": [1.0] * len(self.training_pairs["match"]),
+                    "distinct": [1.0] * len(self.training_pairs["distinct"]),
+                },
+            )
+            for label in ("match", "distinct"):
+                label = cast(Literal["match", "distinct"], label)
+                if new_weights is not None and label in new_weights:
+                    stored_weights[label].extend(
+                        1.0 if weight is None else float(weight)
+                        for weight in new_weights[label]
+                    )
+                else:
+                    stored_weights[label].extend([1.0] * len(labeled_pairs[label]))
+
         self.training_pairs["match"].extend(labeled_pairs["match"])
         self.training_pairs["distinct"].extend(labeled_pairs["distinct"])
 
         if self.active_learner:
-            examples, y = flatten_training(labeled_pairs)
+            examples, y, weights = flatten_training(labeled_pairs)
 
             try:
-                self.active_learner.mark(examples, y)
+                self.active_learner.mark(examples, y, weights)
             except dedupe.predicates.NoIndexError as e:
                 raise UserWarning(
                     "The record\n"
@@ -1312,7 +1410,7 @@ class ActiveMatching(Matching):
                     "of the `prepare_training()` method"
                 )
 
-    def _checkTrainingPairs(self, labeled_pairs: TrainingData) -> None:
+    def _checkTrainingPairs(self, labeled_pairs: WeightedTrainingData) -> None:
         try:
             labeled_pairs.items()
             labeled_pairs["match"]
@@ -1321,6 +1419,47 @@ class ActiveMatching(Matching):
             raise ValueError(
                 "labeled_pairs must be a dictionary with keys " '"distinct" and "match"'
             )
+
+        weights = labeled_pairs.get("weights")
+        if weights is not None:
+            try:
+                weights.items()
+            except AttributeError:
+                raise ValueError(
+                    '"weights" must be a dictionary with keys '
+                    '"distinct" and/or "match" and values that are '
+                    "lists of numbers"
+                )
+            unknown_labels = set(weights) - {"match", "distinct"}
+            if unknown_labels:
+                raise ValueError(
+                    f'unknown keys in "weights": {sorted(unknown_labels)}. '
+                    'Valid keys are "match" and "distinct"'
+                )
+            for label in ("match", "distinct"):
+                label = cast(Literal["match", "distinct"], label)
+                if label not in weights:
+                    continue
+                try:
+                    label_weights = list(weights[label])
+                except TypeError:
+                    raise ValueError(
+                        f'"weights[{label!r}]" must be a list of numbers, '
+                        f"got {weights[label]!r}"
+                    )
+                if len(label_weights) != len(labeled_pairs[label]):
+                    raise ValueError(
+                        f"the number of weights ({len(label_weights)}) does "
+                        f"not match the number of pairs "
+                        f'({len(labeled_pairs[label])}) for label "{label}"'
+                    )
+                for weight in label_weights:
+                    if weight is None:
+                        continue
+                    if not isinstance(weight, numbers.Real) or not weight >= 0:
+                        raise ValueError(
+                            "weights must be non-negative numbers, " f"got {weight!r}"
+                        )
 
         if labeled_pairs["match"]:
             pair = labeled_pairs["match"][0]
@@ -1403,7 +1542,7 @@ class Dedupe(ActiveMatching, DedupeMatching):
 
         # We need the active learner to know about all our
         # existing training data, so add them to data dictionary
-        examples, y = flatten_training(self.training_pairs)
+        examples, y, weights = flatten_training(self.training_pairs)
 
         self.active_learner = labeler.DedupeDisagreementLearner(
             self.data_model.predicates,
@@ -1412,7 +1551,7 @@ class Dedupe(ActiveMatching, DedupeMatching):
             index_include=examples,
         )
 
-        self.active_learner.mark(examples, y)
+        self.active_learner.mark(examples, y, weights)
 
     def _checkData(self, data: Data) -> None:
         if len(data) == 0:
@@ -1471,7 +1610,7 @@ class Link(ActiveMatching):
 
         # We need the active learner to know about all our
         # existing training data, so add them to data dictionaries
-        examples, y = flatten_training(self.training_pairs)
+        examples, y, weights = flatten_training(self.training_pairs)
 
         self.active_learner = labeler.RecordLinkDisagreementLearner(
             self.data_model.predicates,
@@ -1481,7 +1620,7 @@ class Link(ActiveMatching):
             index_include=examples,
         )
 
-        self.active_learner.mark(examples, y)
+        self.active_learner.mark(examples, y, weights)
 
     def _checkData(self, data_1: Data, data_2: Data) -> None:
         if len(data_1) == 0:
@@ -1538,8 +1677,15 @@ class SettingsFileLoadingException(Exception):
 
 
 def flatten_training(
-    training_pairs: TrainingData,
-) -> tuple[TrainingExamples, LabelsLike]:
+    training_pairs: WeightedTrainingData,
+) -> tuple[TrainingExamples, LabelsLike, numpy.typing.NDArray[numpy.float64] | None]:
+    """
+    Flatten labeled pairs into a list of examples and aligned arrays of
+    labels and, if the training data includes weights, per-example
+    weights. The weights are ``None`` when no weights were marked, and
+    otherwise align with the examples, with missing weights taking the
+    default weight of 1.0.
+    """
     examples: TrainingExamples = []
     y = []
 
@@ -1551,7 +1697,55 @@ def flatten_training(
         encoded_y = 1 if label == "match" else 0
         y.extend([encoded_y] * len(pairs))
 
-    return examples, numpy.array(y)
+    return examples, numpy.array(y), _aligned_weights(training_pairs)
+
+
+def _aligned_weights(
+    training_pairs: WeightedTrainingData,
+) -> numpy.typing.NDArray[numpy.float64] | None:
+    """
+    Return an array of weights aligned with the flattened (match, then
+    distinct) pairs, or None if the training data has no weights.
+    Missing weights take the default weight of 1.0.
+    """
+    stored_weights = training_pairs.get("weights")
+    if stored_weights is None:
+        return None
+
+    weights: list[float] = []
+    for label in ("match", "distinct"):
+        label = cast(Literal["match", "distinct"], label)
+
+        pairs = training_pairs[label]
+        label_weights = list(stored_weights.get(label, []))
+        weights.extend(
+            1.0 if weight is None else float(weight)
+            for weight in label_weights[: len(pairs)]
+        )
+        # pairs without a recorded weight get the default weight
+        weights.extend([1.0] * (len(pairs) - len(label_weights)))
+
+    return numpy.array(weights)
+
+
+def _fit_supports_sample_weight(classifier: Classifier) -> bool:
+    """
+    Whether the classifier's fit method can accept a 'sample_weight'
+    argument, either explicitly or through **kwargs.
+    """
+    try:
+        parameters = inspect.signature(classifier.fit).parameters.values()
+    except (TypeError, ValueError):
+        # some callables, like cythonized functions, have no
+        # introspectable signature; optimistically assume support and
+        # let any TypeError from the fit call itself surface
+        return True
+
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "sample_weight"
+        for parameter in parameters
+    )
 
 
 def _cleanup_scores(arr: Scores) -> None:
